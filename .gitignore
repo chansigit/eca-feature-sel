@@ -1,0 +1,10 @@
+# Computed results and data live on $SCRATCH, never in git.
+cache/
+*.parquet
+*.tsv
+*.h5ad
+*.gtf.gz
+__pycache__/
+*.pyc
+# local config override (keep the tracked config.yaml as the template)
+config.local.yaml
