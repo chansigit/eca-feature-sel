@@ -18,7 +18,6 @@ Staleness = stage-1 output missing OR h5ad newer than it. So re-running only
 recomputes changed/new datasets; everything else is reused.
 """
 import argparse
-import glob
 import gzip
 import json
 import os
@@ -27,6 +26,7 @@ import subprocess
 import time
 import urllib.request
 
+import h5py
 import numpy as np
 import pandas as pd
 import yaml
@@ -45,6 +45,7 @@ SPECIES = ("human", "mouse")
 def load_config(path):
     with open(path) as fh:
         cfg = yaml.safe_load(fh)
+    cfg["_config_path"] = path
     c = cfg["cache_root"]
     cfg["_dirs"] = {d: os.path.join(c, d) for d in
                     ("stage1", "ref", "master", "vocab", "jobs")}
@@ -54,16 +55,22 @@ def load_config(path):
     return cfg
 
 
-def species_of(dsdir):
-    """Prefer curation_stats.json species; fall back to the dir-name prefix."""
+def _read_stats(dsdir):
     js = os.path.join(dsdir, "curation_stats.json")
-    if os.path.exists(js):
-        try:
-            sp = json.load(open(js)).get("species")
-            if sp in SPECIES:
-                return sp
-        except Exception:
-            pass
+    if not os.path.exists(js):
+        return {}
+    try:
+        with open(js) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def species_of(dsdir, stats=None):
+    """Prefer curation_stats.json species; fall back to the dir-name prefix."""
+    sp = (stats or _read_stats(dsdir)).get("species")
+    if sp in SPECIES:
+        return sp
     b = os.path.basename(dsdir)
     if b.startswith(("ts-", "3ca-")):
         return "human"
@@ -72,19 +79,124 @@ def species_of(dsdir):
     return None
 
 
+def _decode_attr_list(v):
+    return [x.decode() if isinstance(x, bytes) else str(x) for x in v]
+
+
+def _h5ad_info(path):
+    """Return minimal content metadata for h5ad selection, without loading AnnData."""
+    try:
+        with h5py.File(path, "r") as f:
+            if "layers/counts" not in f or "var/gene_id_harmonized" not in f:
+                return None
+            shape = f["layers/counts"].attrs.get("shape")
+            if shape is None or len(shape) != 2:
+                return None
+            obs_cols = set(_decode_attr_list(f["obs"].attrs.get("column-order", []))) if "obs" in f else set()
+            post_filter_cols = {"doublet_score", "predicted_doublet", "mrvi_leiden", "harmony_leiden"}
+            return {
+                "path": path,
+                "n_obs": int(shape[0]),
+                "n_vars": int(shape[1]),
+                "has_post_filter_cols": bool(obs_cols & post_filter_cols),
+            }
+    except Exception:
+        return None
+
+
+def choose_h5ad(dsdir, stats):
+    """Choose the dataset h5ad by content, not by filename convention.
+
+    Prefer files that are usable by worker.py and whose shape matches
+    curation_stats.json. If multiple files remain equivalent, use content-derived
+    post-filter columns as a tie-breaker, then fall back to mtime/path for a
+    deterministic choice.
+    """
+    candidates = []
+    for name in sorted(os.listdir(dsdir)):
+        path = os.path.join(dsdir, name)
+        if not os.path.isfile(path) or not name.lower().endswith(".h5ad"):
+            continue
+        info = _h5ad_info(path)
+        if info is None:
+            continue
+        score = 0
+        if stats.get("cells_kept") is not None and info["n_obs"] == int(stats["cells_kept"]):
+            score += 4
+        if stats.get("genes") is not None and info["n_vars"] == int(stats["genes"]):
+            score += 2
+        if info["has_post_filter_cols"]:
+            score += 1
+        candidates.append((score, os.path.getmtime(path), path))
+    if not candidates:
+        return None
+    return max(candidates)[2]
+
+
+def _resolve_path(path, base):
+    path = os.path.expanduser(str(path))
+    return path if os.path.isabs(path) else os.path.abspath(os.path.join(base, path))
+
+
+def _stage1_record(cfg, key, sp, h5ad):
+    if sp not in SPECIES:
+        raise SystemExit(f"{key}: species={sp!r} (expected one of {SPECIES})")
+    if not os.path.exists(h5ad):
+        raise SystemExit(f"{key}: h5ad not found: {h5ad}")
+    par = os.path.join(cfg["_dirs"]["stage1"], key + ".parquet")
+    stale = (not os.path.exists(par)) or (os.path.getmtime(h5ad) > os.path.getmtime(par))
+    return {"key": key, "species": sp, "h5ad": h5ad, "out": par, "stale": stale}
+
+
+def scan_input_list(cfg):
+    paths = cfg.get("inputs_tsv")
+    if not paths:
+        return None
+    if isinstance(paths, str):
+        paths = [paths]
+    out, seen = [], set()
+    config_dir = os.path.dirname(os.path.abspath(cfg["_config_path"]))
+    for raw_path in paths:
+        path = _resolve_path(raw_path, config_dir)
+        if not os.path.exists(path):
+            raise SystemExit(f"inputs_tsv not found: {path}")
+        with open(path) as fh:
+            for n, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split("\t")
+                if fields[0] == "sample_key":
+                    continue
+                if len(fields) != 3:
+                    raise SystemExit(f"{path}:{n}: expected 3 tab-separated fields: sample_key species h5ad")
+                key, sp, h5ad = fields
+                if key in seen:
+                    raise SystemExit(f"{path}:{n}: duplicate sample_key {key!r}")
+                seen.add(key)
+                out.append(_stage1_record(cfg, key, sp, _resolve_path(h5ad, os.path.dirname(path))))
+    return out
+
+
 def scan_corpus(cfg):
-    """One record per dataset with a *_filtered.h5ad, flagged stale if its
-    stage-1 output is missing or older than the h5ad."""
+    """One record per dataset with a usable h5ad, selected by content and flagged
+    stale if its stage-1 output is missing or older than the h5ad."""
+    listed = scan_input_list(cfg)
+    if listed is not None:
+        return listed
     out = []
-    for f in sorted(glob.glob(os.path.join(cfg["corpus_root"], "*", "*_filtered.h5ad"))):
-        dsdir = os.path.dirname(f)
-        key = os.path.basename(dsdir)
-        sp = species_of(dsdir)
+    for key in sorted(os.listdir(cfg["corpus_root"])):
+        dsdir = os.path.join(cfg["corpus_root"], key)
+        if not os.path.isdir(dsdir):
+            continue
+        stats = _read_stats(dsdir)
+        sp = species_of(dsdir, stats)
         if sp is None:
             continue
-        par = os.path.join(cfg["_dirs"]["stage1"], key + ".parquet")
-        stale = (not os.path.exists(par)) or (os.path.getmtime(f) > os.path.getmtime(par))
-        out.append({"key": key, "species": sp, "h5ad": f, "out": par, "stale": stale})
+        f = choose_h5ad(dsdir, stats)
+        if f is None:
+            continue
+        out.append(_stage1_record(cfg, key, sp, f))
     return out
 
 

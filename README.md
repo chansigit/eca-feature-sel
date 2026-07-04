@@ -42,7 +42,7 @@ present so you can also just filter the TSV.
 
 ```bash
 PY=/path/to/venv/bin/python          # needs h5py numpy pandas pyarrow yaml
-# edit config.yaml: corpus_root, cache_root (MUST be on $SCRATCH), venv_python
+# edit config.yaml: inputs_tsv, cache_root (MUST be on $SCRATCH), venv_python
 
 $PY featuresel.py status             # what's done / stale / missing
 $PY featuresel.py ref                # one-time: Ensembl biotype reference (needs internet)
@@ -66,13 +66,23 @@ Each `build` writes `cache/vocab/<tag>/vocab_{human,mouse}.tsv` (key column =
 featuresel.py   CLI (status/measure/ref/build/refresh/diff/list)
 worker.py       per-dataset Stage-1 (streaming h5py, CSR+CSC), run by each array task
 config.yaml     paths + slurm resources + default policy
+human.tsv       explicit human input dataset list: sample_key, species, h5ad
+mouse.tsv       explicit mouse input dataset list: sample_key, species, h5ad
 # cache_root (on $SCRATCH, git-ignored): stage1/  ref/  master/  vocab/<tag>/  jobs/
 ```
 
 ## Notes
-- Reuse is mtime-based: a dataset is recomputed only if its `h5ad` is newer than its
-  cached stat (or missing). Removing a dataset from the corpus drops it from the next
-  build automatically.
+- Inputs are explicit when `inputs_tsv` is set. It can be one TSV path or a YAML list
+  of TSV paths, for example `human.tsv` and `mouse.tsv`. Each TSV must have three
+  tab-separated columns: `sample_key`, `species`, and `h5ad`. Lines beginning with `#`
+  are ignored; a header row is allowed. Relative h5ad paths are resolved relative to
+  the TSV file.
+- If `inputs_tsv` is unset, corpus discovery falls back to scanning immediate dataset
+  directories under `corpus_root` for usable `.h5ad` files. This fallback does not
+  assume an h5ad filename suffix; files are chosen by content.
+- Reuse is mtime-based: a dataset is recomputed only if its selected `h5ad` is newer
+  than its cached stat (or missing). Removing a dataset from the corpus drops it from
+  the next build automatically.
 - Per-dataset jobs are tiny (streaming bincount, <1 GB peak) — they queue fast and
   spread across nodes.
 - Not a coverage fix: mouse lncRNA are limited upstream (Tabula Muris quantified a

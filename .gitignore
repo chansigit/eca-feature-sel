@@ -2,6 +2,8 @@
 cache/
 *.parquet
 *.tsv
+!human.tsv
+!mouse.tsv
 *.h5ad
 *.gtf.gz
 __pycache__/

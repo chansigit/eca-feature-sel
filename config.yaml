@@ -2,7 +2,10 @@
 # Paths are cluster-specific; edit for your environment. cache_root MUST be on
 # $SCRATCH (never $HOME) per Sherlock policy.
 
-corpus_root: /scratch/users/chensj16/sc-curation-output     # holds <dataset>/<*>_filtered.h5ad
+corpus_root: /scratch/users/chensj16/sc-curation-output     # fallback auto-discovery root
+inputs_tsv:                                                 # explicit sample_key/species/h5ad lists
+  - human.tsv
+  - mouse.tsv
 cache_root:  /scratch/users/chensj16/eca-feature-sel/cache   # all computed results (reused)
 venv_python: /scratch/users/chensj16/venvs/dl2025/.venv/bin/python
 ensembl_release: "112"                                        # for the biotype reference
