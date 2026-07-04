@@ -32,7 +32,7 @@ The consistency rule keeps genes detected above threshold f in at least k datase
 
 n_datasets_with_detection_rate_above_f(g) ≥ k
 
-The strength rule keeps context-specific genes that may appear in fewer datasets but show a strong signal where they are present. A gene passes this rule when it is detected in a sufficiently large fraction of cells in at least one dataset and its expression among detected cells is high relative to genes that pass the consistency rule.
+The strength rule retains genes that are not broadly detected across datasets but show strong evidence in at least one dataset.
 
 The final candidate set is:
 
