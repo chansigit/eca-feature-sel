@@ -28,15 +28,11 @@ pooled_detection_rate(g) = ∑_d n_detected(d, g) / ∑_d n_d
 
 A gene is included if it satisfies either a consistency rule or a strength rule.
 
-The consistency rule keeps genes detected above threshold f in at least k datasets:
-
-n_datasets_with_detection_rate_above_f(g) ≥ k
+The consistency rule keeps genes whose detection rate is at least f in k or more datasets.
 
 The strength rule retains genes that are not broadly detected across datasets but show strong evidence in at least one dataset.
 
-The final candidate set is:
-
-Candidate(g) = Consistency(g) OR Strength(g)
+Genes passing either rule are included in the candidate vocabulary.
 
 ## Optional Veto
 
