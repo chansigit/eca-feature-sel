@@ -18,7 +18,7 @@ Built for HPC (Slurm): measurement fans out one small job per dataset and is
   cut by the data.
 - **Measurement ≠ policy.** Stage 1 computes and caches per-gene stats and *deletes
   nothing*. Selection (Stage 3) is instant and re-runnable: it applies thresholds
-  and — only if you ask — vetoes specific gene families.
+  and a category rule.
 
 ### Inclusion rule
 A harmonized gene is a **candidate** if either arm holds:
@@ -28,15 +28,17 @@ A harmonized gene is a **candidate** if either arm holds:
 
 `N` emerges from the thresholds; it is not preset.
 
-### Biotype veto (off by default)
+### Category rule
 Every gene is annotated (biotype + family flags: OR, IG/TR V·D·J·C, taste,
 vomeronasal, mt, hb, ribo, sex) and each snapshot reports what each scenario costs:
+- **default** — drop pseudogenes after count-driven candidate selection.
 - **narrow** — drop OR / vomeronasal / taste / IG-V·D·J / TR-V·D·J; **keep** IG-C/TR-C
   constant regions. Robust lncRNA (MALAT1/NEAT1/XIST) survive on data alone.
 - **wide** — narrow + drop all non-`protein_coding` (also drops MALAT1/NEAT1/XIST).
 
-Turn a scenario on with `--veto`; the `veto_narrow`/`veto_wide` columns are always
-present so you can also just filter the TSV.
+Set categories with `--category-rule`; the legacy `--veto` alias still works. The
+`category_excluded`, `veto_narrow`, and `veto_wide` columns are written so you can
+also filter the TSV directly.
 
 ## Usage
 
@@ -52,7 +54,7 @@ $PY featuresel.py refresh            # measure -> wait -> build, one shot
 
 # decide the gene range:
 $PY featuresel.py build --k 2 --tag loose         # try a looser threshold
-$PY featuresel.py build --veto is_OR,is_IG_V,is_IG_D,is_IG_J,is_TR_V,is_TR_D,is_TR_J,is_vomeronasal,is_taste --tag narrow
+$PY featuresel.py build --category-rule is_pseudogene,is_OR,is_IG_V,is_IG_D,is_IG_J,is_TR_V,is_TR_D,is_TR_J,is_vomeronasal,is_taste --tag narrow
 $PY featuresel.py list                            # all snapshots
 $PY featuresel.py diff latest narrow              # genes added / removed between snapshots
 ```

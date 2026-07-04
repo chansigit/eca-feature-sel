@@ -20,9 +20,7 @@ If multiple features map to the same harmonized gene, detection is counted once 
 
 ## Cross-Dataset Summary
 
-For each species, gene statistics are aggregated across its datasets. For each gene, we summarize its dataset coverage, maximum detection rate, median detection rate, pooled detection rate, and maximum expression among detected cells.
-
-pooled_detection_rate(g) = ∑_d n_detected(d, g) / ∑_d n_d
+For each species, gene statistics are aggregated across its datasets. For each gene, we summarize its dataset coverage, maximum detection rate, median detection rate, and maximum expression among detected cells.
 
 ## Vocabulary Rule
 
@@ -34,9 +32,9 @@ The strength rule retains genes that are not broadly detected across datasets bu
 
 Genes passing either rule are included in the candidate vocabulary.
 
-## Optional Veto
+## Category Rule
 
-Biotype and gene-family filters are optional vetoes applied after candidate selection. They do not determine primary inclusion.
+After count-driven candidate selection, a category rule removes genes from excluded categories. The current policy discards pseudogenes. This rule is applied after the consistency and strength rules, so it does not define primary inclusion.
 
 ## Output
 

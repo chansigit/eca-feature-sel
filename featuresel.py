@@ -3,7 +3,7 @@
 
 Measurement (Stage 1, Slurm-parallel, cached) is separated from policy (Stage 3,
 instant, re-runnable). Human and mouse are built independently in their own
-Ensembl ID spaces. Nothing is deleted unless a biotype/family flag is vetoed.
+Ensembl ID spaces. Category rules are applied only after count-driven selection.
 
 Subcommands:
   status               scan corpus vs cache; report done / stale / missing
@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DET_THRESH = [0.005, 0.01, 0.02, 0.05]
 NARROW = ["is_OR", "is_vomeronasal", "is_taste",
           "is_IG_V", "is_IG_D", "is_IG_J", "is_TR_V", "is_TR_D", "is_TR_J"]
-FLAGCOLS = NARROW + ["is_IG_C", "is_TR_C", "is_mt", "is_hb", "is_ribo", "is_sex"]
+FLAGCOLS = NARROW + ["is_pseudogene", "is_IG_C", "is_TR_C", "is_mt", "is_hb", "is_ribo", "is_sex"]
 SPECIES = ("human", "mouse")
 
 
@@ -302,7 +302,7 @@ def aggregate(cfg):
 
 
 # ---------------------------------------------------------------------- select
-def select_snapshot(cfg, f, k, sdet, sq, veto, tag):
+def select_snapshot(cfg, f, k, sdet, sq, category_rule, tag):
     md = cfg["_dirs"]["master"]
     tag = tag or time.strftime("%Y%m%d-%H%M%S")
     outdir = os.path.join(cfg["_dirs"]["vocab"], tag)
@@ -319,6 +319,8 @@ def select_snapshot(cfg, f, k, sdet, sq, veto, tag):
             s[c] = s[c].fillna(False).astype(bool) if c in s else False
         if "biotype" not in s:
             s["biotype"] = None
+        bt = s["biotype"].fillna("")
+        s["is_pseudogene"] = s["is_pseudogene"] | bt.str.contains("pseudogene", case=False, na=False)
         cons = (det >= f).sum(axis=1).reindex(s.index).fillna(0) >= k  # arbitrary f from matrix
         qbar = s.loc[cons, "max_mean_expr"].quantile(sq) if cons.any() else np.inf
         strength = (s["max_det"] >= sdet) & (s["max_mean_expr"] >= qbar)
@@ -327,9 +329,13 @@ def select_snapshot(cfg, f, k, sdet, sq, veto, tag):
         bt = cand["biotype"].fillna("")
         cand["veto_narrow"] = cand[NARROW].any(axis=1)
         cand["veto_wide"] = cand["veto_narrow"] | (bt.ne("protein_coding") & bt.ne(""))
-        applied = cand[veto].any(axis=1) if veto else pd.Series(False, index=cand.index)
+        unknown = [c for c in category_rule if c not in cand.columns]
+        if unknown:
+            raise SystemExit(f"unknown category_rule flag(s): {unknown}")
+        applied = cand[category_rule].any(axis=1) if category_rule else pd.Series(False, index=cand.index)
+        cand["category_excluded"] = applied
         cand["selected"] = ~applied
-        cols = (["symbol", "biotype", "selected", "veto_narrow", "veto_wide",
+        cols = (["symbol", "biotype", "selected", "category_excluded", "veto_narrow", "veto_wide",
                  "n_datasets_present", "max_det", "median_det_present",
                  "max_mean_expr", "pooled_det"] + FLAGCOLS)
         cols = [c for c in cols if c in cand.columns]
@@ -339,7 +345,7 @@ def select_snapshot(cfg, f, k, sdet, sq, veto, tag):
         counts[sp] = {"candidate": int(len(cand)), "selected": int(cand["selected"].sum())}
         print(f"  [{sp}] candidate={counts[sp]['candidate']} selected={counts[sp]['selected']}")
     meta = {"tag": tag, "f": f, "k": k, "strength_det": sdet, "strength_q": sq,
-            "veto": veto, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "counts": counts}
+            "category_rule": category_rule, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "counts": counts}
     json.dump(meta, open(os.path.join(outdir, "params.json"), "w"), indent=2)
     latest = os.path.join(cfg["_dirs"]["vocab"], "latest")
     if os.path.islink(latest) or os.path.exists(latest):
@@ -350,17 +356,22 @@ def select_snapshot(cfg, f, k, sdet, sq, veto, tag):
 
 def _select_params(cfg, args):
     d = cfg["select"]
+    category_rule = d.get("category_rule", d.get("veto", []))
+    if args.veto:
+        category_rule = args.veto.split(",")
+    if args.category_rule:
+        category_rule = args.category_rule.split(",")
     return (args.f if args.f is not None else d["f"],
             args.k if args.k is not None else d["k"],
             d["strength_det"], d["strength_q"],
-            args.veto.split(",") if args.veto else d.get("veto", []))
+            category_rule)
 
 
 def cmd_build(cfg, args):
     aggregate(cfg)
-    f, k, sdet, sq, veto = _select_params(cfg, args)
-    print(f"selecting (f={f}, k={k}, strength={sdet}/q{sq}, veto={veto or 'none'})")
-    select_snapshot(cfg, f, k, sdet, sq, veto, args.tag)
+    f, k, sdet, sq, category_rule = _select_params(cfg, args)
+    print(f"selecting (f={f}, k={k}, strength={sdet}/q{sq}, category_rule={category_rule or 'none'})")
+    select_snapshot(cfg, f, k, sdet, sq, category_rule, args.tag)
 
 
 def cmd_refresh(cfg, args):
@@ -402,7 +413,8 @@ def cmd_list(cfg, args):
             m = json.load(open(p))
             c = m.get("counts", {})
             sel = {sp: c[sp]["selected"] for sp in c}
-            print(f"  {tag}  f={m['f']} k={m['k']} veto={m['veto'] or 'none'}  selected={sel}")
+            category_rule = m.get("category_rule", m.get("veto", []))
+            print(f"  {tag}  f={m['f']} k={m['k']} category_rule={category_rule or 'none'}  selected={sel}")
 
 
 # ------------------------------------------------------------ biotype reference
@@ -430,6 +442,7 @@ def _parse_gtf(path):
 
 def _add_flags(df, sp):
     s, bt = df["symbol"].fillna(""), df["biotype"].fillna("")
+    df["is_pseudogene"] = bt.str.contains("pseudogene", case=False, na=False)
     if sp == "human":
         df["is_OR"] = s.str.match(r"^OR\d")
         df["is_vomeronasal"] = s.str.match(r"^VN[12]R")
@@ -484,7 +497,9 @@ def main():
 
     def add_build_opts(p):
         p.add_argument("--f", type=float); p.add_argument("--k", type=int)
-        p.add_argument("--veto"); p.add_argument("--tag")
+        p.add_argument("--category-rule")
+        p.add_argument("--veto", help=argparse.SUPPRESS)  # backward-compatible alias
+        p.add_argument("--tag")
         p.add_argument("--force", action="store_true")
     add_build_opts(sub.add_parser("build"))
     add_build_opts(sub.add_parser("refresh"))

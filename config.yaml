@@ -18,11 +18,10 @@ slurm:
   array_throttle: 100        # max concurrent array tasks (be nice to the scheduler)
 
 # Default selection policy. Everything here is overridable on the `build` CLI.
-# Nothing is deleted unless a flag is listed in `veto`.
+# The category rule removes selected categories after count-driven candidate selection.
 select:
   f: 0.01                    # per-dataset detection floor (one of 0.005/0.01/0.02/0.05)
   k: 3                       # consistency arm: min #datasets a gene must clear f in
   strength_det: 0.25         # strength arm: per-dataset detection floor
   strength_q: 0.90           # strength arm: max_mean_expr quantile bar
-  veto: []                   # flags to actually drop, e.g. [is_OR, is_IG_V, is_IG_D,
-                             #   is_IG_J, is_TR_V, is_TR_D, is_TR_J, is_vomeronasal, is_taste]
+  category_rule: [is_pseudogene]
