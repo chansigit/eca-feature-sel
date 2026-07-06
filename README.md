@@ -1,9 +1,8 @@
 # eca-feature-sel
 
-Counts-driven gene-vocabulary selection for single-cell **foundation-model**
+Data-driven gene-vocabulary selection for single-cell **foundation-model**
 training. Turns a large corpus of harmonized `h5ad` datasets into a fixed,
-cross-dataset gene vocabulary — **from the data** — and lets you decide the gene
-range interactively over time.
+cross-dataset gene vocabulary using detection, HVG, and cluster-marker evidence.
 
 Built for HPC (Slurm): measurement fans out one small job per dataset and is
 **cached**, so periodic re-runs only recompute what changed.
@@ -13,18 +12,22 @@ Built for HPC (Slurm): measurement fans out one small job per dataset and is
 - **Two vocabularies, independent.** Human (Ensembl `ENSG`) and mouse (`ENSMUSG`)
   are built separately in their own ID spaces — no ortholog mapping. Species is
   read from each dataset's `curation_stats.json`.
-- **Data-first.** Detection from raw `layers/counts` (the CSR/CSC nonzero pattern)
-  is the primary axis; `.var` biotype is auxiliary. The globally-near-zero tail is
-  cut by the data.
-- **Measurement ≠ policy.** Stage 1 computes and caches per-gene stats and *deletes
-  nothing*. Selection (Stage 3) is instant and re-runnable: it applies thresholds
-  and a category rule.
+- **Data-first.** Detection from raw `layers/counts`, per-dataset HVGs, and
+  within-dataset cluster markers are used as inclusion evidence. `.var` biotype is
+  auxiliary and is applied only by the category rule.
+- **Measurement ≠ policy.** Stage 1 caches per-gene detection stats. Stage 2 caches
+  per-dataset HVG and cluster-DEG selections. Selection is instant and re-runnable:
+  it unions the cached evidence and applies a category rule.
 
 ### Inclusion rule
-A harmonized gene is a **candidate** if either arm holds:
-- **consistency** — detected (`det ≥ f`) in `≥ k` datasets (default f=1%, k=3);
-- **strength** — `max_det ≥ 0.25` and `max_mean_expr ≥` q0.90 (rescues real
-  tissue-restricted markers like `INS`/`SFTPC` the consistency arm would miss).
+A harmonized gene is a **candidate** if any v2 inclusion rule holds:
+- **detection** — detected in at least `min_frac` cells in at least
+  `min_dataset_occurrence` datasets (default `min_frac=0.01`,
+  `min_dataset_occurrence=10`);
+- **HVG** — selected as a highly variable gene within at least `min_datasets`
+  datasets (default top 3,000 HVGs per dataset);
+- **cluster-DEG** — selected as a one-vs-rest marker for at least one eligible
+  cell-type or cluster group.
 
 `N` emerges from the thresholds; it is not preset.
 
@@ -37,40 +40,45 @@ vomeronasal, mt, hb, ribo, sex) and each snapshot reports what each scenario cos
 - **wide** — narrow + drop all non-`protein_coding` (also drops MALAT1/NEAT1/XIST).
 
 Set categories with `--category-rule`; the legacy `--veto` alias still works. The
-`category_excluded`, `veto_narrow`, and `veto_wide` columns are written so you can
-also filter the TSV directly.
+`category_excluded`, `selected_by_detection`, `selected_by_hvg`,
+`selected_by_cluster_deg`, `veto_narrow`, and `veto_wide` columns are written so
+you can also filter the TSV directly.
 
 ## Usage
 
 ```bash
-PY=/path/to/venv/bin/python          # needs h5py numpy pandas pyarrow yaml
+PY=/path/to/venv/bin/python          # needs h5py numpy pandas pyarrow yaml scanpy scipy
 # edit config.yaml: inputs_tsv, cache_root (MUST be on $SCRATCH), venv_python
 
 $PY featuresel.py status             # what's done / stale / missing
 $PY featuresel.py ref                # one-time: Ensembl biotype reference (needs internet)
 $PY featuresel.py measure            # Slurm job array over stale/new datasets (reuses rest)
-$PY featuresel.py build              # aggregate cached stats + select -> versioned snapshot
-$PY featuresel.py refresh            # measure -> wait -> build, one shot
+$PY featuresel.py measure-v2         # Slurm job array for HVG + cluster-DEG cache
+$PY featuresel.py build-v2           # union detection/HVG/cluster-DEG -> snapshot
+$PY featuresel.py refresh-v2         # measure + measure-v2 -> wait -> build-v2
 
 # decide the gene range:
-$PY featuresel.py build --k 2 --tag loose         # try a looser threshold
-$PY featuresel.py build --category-rule is_pseudogene,is_OR,is_IG_V,is_IG_D,is_IG_J,is_TR_V,is_TR_D,is_TR_J,is_vomeronasal,is_taste --tag narrow
+$PY featuresel.py build-v2 --min-dataset-occurrence 8 --tag loose
+$PY featuresel.py build-v2 --category-rule is_pseudogene,is_OR,is_IG_V,is_IG_D,is_IG_J,is_TR_V,is_TR_D,is_TR_J,is_vomeronasal,is_taste --tag narrow
 $PY featuresel.py list                            # all snapshots
 $PY featuresel.py diff latest narrow              # genes added / removed between snapshots
 ```
 
-Each `build` writes `cache/vocab/<tag>/vocab_{human,mouse}.tsv` (key column =
+Each `build-v2` writes `cache/vocab/<tag>/vocab_{human,mouse}.tsv` (key column =
 `harmonized_id`, the FM token id) + `params.json`, and updates `cache/vocab/latest`.
+The legacy `build` command is still available for older detection/strength
+snapshots.
 
 ## Layout
 
 ```
-featuresel.py   CLI (status/measure/ref/build/refresh/diff/list)
-worker.py       per-dataset Stage-1 (streaming h5py, CSR+CSC), run by each array task
+featuresel.py   CLI (status/measure/measure-v2/ref/build-v2/refresh-v2/diff/list)
+worker.py       per-dataset Stage-1 detection stats, run by each array task
+worker_v2.py    per-dataset Stage-2 HVG + cluster-DEG selections
 config.yaml     paths + slurm resources + default policy
 human.tsv       explicit human input dataset list: sample_key, species, h5ad
 mouse.tsv       explicit mouse input dataset list: sample_key, species, h5ad
-# cache_root (on $SCRATCH, git-ignored): stage1/  ref/  master/  vocab/<tag>/  jobs/
+# cache_root (on $SCRATCH, git-ignored): stage1/  stage2/  ref/  master/  vocab/<tag>/  jobs/
 ```
 
 ## Notes
@@ -85,7 +93,7 @@ mouse.tsv       explicit mouse input dataset list: sample_key, species, h5ad
 - Reuse is mtime-based: a dataset is recomputed only if its selected `h5ad` is newer
   than its cached stat (or missing). Removing a dataset from the corpus drops it from
   the next build automatically.
-- Per-dataset jobs are tiny (streaming bincount, <1 GB peak) — they queue fast and
-  spread across nodes.
+- Stage-1 jobs are tiny (streaming bincount, <1 GB peak). Stage-2 jobs load one
+  dataset at a time with Scanpy and use the separate `slurm_v2` resources.
 - Not a coverage fix: mouse lncRNA are limited upstream (Tabula Muris quantified a
   ~23k-gene, protein-coding-focused reference), not by cell count.

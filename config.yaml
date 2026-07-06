@@ -17,6 +17,13 @@ slurm:
   cpus: 1
   array_throttle: 100        # max concurrent array tasks (be nice to the scheduler)
 
+slurm_v2:
+  partition: normal
+  time: "04:00:00"
+  mem: 32GB
+  cpus: 4
+  array_throttle: 20
+
 # Default selection policy. Everything here is overridable on the `build` CLI.
 # The category rule removes selected categories after count-driven candidate selection.
 select:
@@ -24,4 +31,35 @@ select:
   k: 3                       # consistency arm: min #datasets a gene must clear f in
   strength_det: 0.25         # strength arm: per-dataset detection floor
   strength_q: 0.90           # strength arm: max_mean_expr quantile bar
+  category_rule: [is_pseudogene]
+
+# Planned selection policy. This is the design target for the next implementation
+# pass; the current build command still uses the legacy select section above.
+select_v2:
+  detection_rule:
+    min_frac: 0.01           # gene must be detected in at least this fraction of cells
+    min_dataset_occurrence: 10  # min datasets where the gene clears min_frac
+
+  hvg_rule:
+    n_top_genes: 3000        # selected independently within each dataset
+    min_datasets: 1          # min datasets where the gene is selected as HVG
+    layer: counts
+    flavor: seurat_v3
+    normalize_target_sum: 10000
+
+  cluster_deg_rule:
+    obs_key_priority: [cell_type_fine, cell_type_coarse, cell_type, cell_subtype, cluster_annotation, cluster, clusters]
+    missing_obs_policy: skip_dataset
+    method: wilcoxon
+    one_vs_rest: true
+    min_cluster_cells: 50
+    min_other_cells: 50
+    min_pct_in_cluster: 0.10
+    min_pct_difference: 0.05
+    min_log2fc: 0.25
+    max_adj_pvalue: 0.05
+    top_n_per_cluster: 100
+    candidate_multiplier: 20
+    min_datasets: 1
+
   category_rule: [is_pseudogene]

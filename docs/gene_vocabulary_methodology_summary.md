@@ -2,39 +2,25 @@
 
 ## Input
 
-We define an explicit dataset list for each species. Each dataset contributes a raw count matrix and a harmonized gene identifier for each feature. Features without a valid harmonized gene identifier are excluded.
+We start from an explicit dataset list for each species. Each dataset contributes raw gene-count measurements and harmonized gene identifiers. Features without a valid harmonized gene identifier are excluded.
 
-For dataset d, let X_d be the raw count matrix with n_d cells. Let h_d(j) be the harmonized gene assigned to feature j. For gene g, let V_d(g) = {j : h_d(j) = g}.
+If multiple features map to the same harmonized gene, they are treated as one gene for detection. This prevents duplicate feature rows from inflating detection rates.
 
-## Per-Dataset Statistics
+## Vocabulary Rules
 
-For each dataset d and gene g, we compute:
+For each gene, detection rate measures the fraction of cells in which that gene has nonzero counts.
 
-sum_counts(d, g) = ∑_{i=1}^{n_d} ∑_{j∈V_d(g)} X_d[i, j]
+Gene vocabulary selection is controlled by three inclusion rules and one category rule.
 
-n_detected(d, g) = ∑_{i=1}^{n_d} 1{∑_{j∈V_d(g)} X_d[i, j] > 0}
+The detection rule selects genes that are detected in at least a minimum fraction of cells in at least a minimum number of datasets. The default threshold is detection in at least 1% of cells in at least 10 datasets.
 
-detection_rate(d, g) = n_detected(d, g) / n_d
+The HVG rule selects highly variable genes independently within each dataset. The default setting selects the top 3,000 highly variable genes per dataset.
 
-If multiple features map to the same harmonized gene, detection is counted once per cell. This prevents duplicate feature rows from inflating detection rates.
+The cluster-DEG rule selects genes that distinguish a cell-type or cluster from the remaining cells within the same dataset. Each eligible group is compared against all other cells in that dataset, and top marker genes are retained after minimum group size, expression prevalence, effect-size, and significance filters.
 
-## Cross-Dataset Summary
+The category rule removes genes from excluded gene categories. The current category rule excludes pseudogenes.
 
-For each species, gene statistics are aggregated across its datasets. For each gene, we summarize its dataset coverage, maximum detection rate, median detection rate, and maximum expression among detected cells.
-
-## Vocabulary Rule
-
-A gene is included if it satisfies either a consistency rule or a strength rule.
-
-The consistency rule keeps genes whose detection rate is at least f in k or more datasets.
-
-The strength rule retains genes that are not broadly detected across datasets but show strong evidence in at least one dataset.
-
-Genes passing either rule are included in the candidate vocabulary.
-
-## Category Rule
-
-After count-driven candidate selection, a category rule removes genes from excluded categories. The current policy discards pseudogenes. This rule is applied after the consistency and strength rules, so it does not define primary inclusion.
+A gene is included in the final vocabulary if it passes the detection rule, the HVG rule, or the cluster-DEG rule, and is not removed by the category rule.
 
 ## Output
 
