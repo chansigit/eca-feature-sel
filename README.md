@@ -100,9 +100,9 @@ mouse.tsv       explicit mouse input dataset list: sample_key, species, h5ad
 - `measure-v2` can pack multiple small datasets into one Slurm array task via
   `slurm_v2.batch_size` and `slurm_v2.batch_max_cells`. This reduces repeated
   Python/Scanpy startup cost while keeping large datasets isolated.
-- Stage-2 meta JSON files include `phase_times_sec` so import, read, HVG, and
-  cluster-DEG bottlenecks can be profiled after a run. `measure-v2-local` processes
-  multiple datasets in one Python process to avoid repeated Scanpy import overhead
-  during local smoke tests.
+- Stage-2 meta JSON files include `phase_times_sec` so lazy import, read, HVG,
+  and cluster-DEG bottlenecks can be profiled after a run. `measure-v2-local`
+  processes multiple datasets in one Python process to avoid repeated Scanpy
+  import overhead during local smoke tests.
 - Not a coverage fix: mouse lncRNA are limited upstream (Tabula Muris quantified a
   ~23k-gene, protein-coding-focused reference), not by cell count.

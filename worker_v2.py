@@ -8,7 +8,6 @@ import time
 
 import numpy as np
 import pandas as pd
-import scanpy as sc
 from scipy import sparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +16,32 @@ import featuresel  # noqa: E402
 
 MISSING_IDS = {"", "nan", "na", "none", "null"}
 MISSING_LABELS = {"", "nan", "na", "none", "null", "unknown", "unassigned"}
+_ANNDATA = None
+_SCANPY = None
+
+
+def _add_phase_time(phase_times, key, value):
+    phase_times[key] = phase_times.get(key, 0.0) + value
+
+
+def _get_anndata(phase_times):
+    global _ANNDATA
+    if _ANNDATA is None:
+        t = time.perf_counter()
+        import anndata as ad
+        _ANNDATA = ad
+        _add_phase_time(phase_times, "anndata_import_sec", time.perf_counter() - t)
+    return _ANNDATA
+
+
+def _get_scanpy(phase_times):
+    global _SCANPY
+    if _SCANPY is None:
+        t = time.perf_counter()
+        import scanpy as sc
+        _SCANPY = sc
+        _add_phase_time(phase_times, "scanpy_import_sec", time.perf_counter() - t)
+    return _SCANPY
 
 
 def _normalize_ids(values):
@@ -99,7 +124,14 @@ def _rank_genes_array(uns, key, group):
     return np.asarray(pd.DataFrame(arr)[group])
 
 
-def _run_hvg(adata, cfg, meta):
+def _hvg_needs_scanpy(adata, cfg):
+    rule = cfg["select_v2"]["hvg_rule"]
+    layer = rule.get("layer", "counts")
+    n_top = min(int(rule.get("n_top_genes", 3000)), adata.n_vars)
+    return layer in adata.layers and n_top > 0 and adata.n_obs > 0 and adata.n_vars > 0
+
+
+def _run_hvg(adata, cfg, meta, phase_times):
     rule = cfg["select_v2"]["hvg_rule"]
     layer = rule.get("layer", "counts")
     if layer not in adata.layers:
@@ -110,6 +142,7 @@ def _run_hvg(adata, cfg, meta):
     if n_top <= 0 or adata.n_obs == 0 or adata.n_vars == 0:
         return pd.DataFrame(columns=["harmonized_id", "hvg_best_rank"])
 
+    sc = _get_scanpy(phase_times)
     try:
         sc.pp.highly_variable_genes(
             adata,
@@ -142,7 +175,7 @@ def _run_hvg(adata, cfg, meta):
     return out.reset_index()
 
 
-def _run_cluster_deg(adata, cfg, meta):
+def _run_cluster_deg(adata, cfg, meta, phase_times):
     rule = cfg["select_v2"]["cluster_deg_rule"]
     obs_key = _choose_obs_key(adata, rule.get("obs_key_priority", []))
     meta["deg_obs_key"] = obs_key
@@ -177,6 +210,7 @@ def _run_cluster_deg(adata, cfg, meta):
     if not candidate_mask.any():
         meta["deg_status"] = "no_candidate_genes_after_prevalence_filter"
         return pd.DataFrame(columns=["harmonized_id"])
+    sc = _get_scanpy(phase_times)
     ad = ad[:, candidate_mask].copy()
     ad.X = ad.layers[layer].copy()
     ad.uns.pop("log1p", None)
@@ -279,8 +313,10 @@ def compute(cfg, h5ad, species, key, out):
         "selection_v2_measure_signature": featuresel.selection_v2_measure_signature(cfg),
     }
     gene_key = "gene_id_harmonized"
-    adata = sc.read_h5ad(h5ad)
-    phase_times["read_h5ad_sec"] = time.perf_counter() - t0
+    ad = _get_anndata(phase_times)
+    t = time.perf_counter()
+    adata = ad.read_h5ad(h5ad)
+    phase_times["read_h5ad_sec"] = time.perf_counter() - t
     t = time.perf_counter()
     if gene_key not in adata.var:
         raise SystemExit(f"{key}: var.{gene_key} not found")
@@ -296,11 +332,13 @@ def compute(cfg, h5ad, species, key, out):
     adata.var_names = [f"var_{i}" for i in range(adata.n_vars)]
     phase_times["prepare_sec"] = time.perf_counter() - t
 
+    if _hvg_needs_scanpy(adata, cfg):
+        _get_scanpy(phase_times)
     t = time.perf_counter()
-    hvg = _run_hvg(adata, cfg, meta)
+    hvg = _run_hvg(adata, cfg, meta, phase_times)
     phase_times["hvg_sec"] = time.perf_counter() - t
     t = time.perf_counter()
-    deg = _run_cluster_deg(adata, cfg, meta)
+    deg = _run_cluster_deg(adata, cfg, meta, phase_times)
     phase_times["cluster_deg_sec"] = time.perf_counter() - t
     t = time.perf_counter()
     hvg = hvg.set_index("harmonized_id") if "harmonized_id" in hvg else pd.DataFrame()
@@ -324,7 +362,10 @@ def compute(cfg, h5ad, species, key, out):
     res.to_parquet(tmp, index=False)
     os.replace(tmp, out)
     phase_times["write_sec"] = time.perf_counter() - t
-    phase_times["total_after_import_sec"] = time.perf_counter() - t0
+    total_sec = time.perf_counter() - t0
+    lazy_import_sec = phase_times.get("anndata_import_sec", 0.0) + phase_times.get("scanpy_import_sec", 0.0)
+    phase_times["total_dataset_sec"] = total_sec
+    phase_times["total_after_import_sec"] = max(0.0, total_sec - lazy_import_sec)
     meta["phase_times_sec"] = {k: round(float(v), 3) for k, v in phase_times.items()}
     meta["n_genes_harmonized"] = int(len(set(adata.var["_efs_harmonized_id"])))
     meta["n_hvg_genes"] = int(res["selected_hvg"].sum()) if "selected_hvg" in res else 0
