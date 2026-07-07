@@ -8,19 +8,18 @@ candidate selection.
 
 Subcommands:
   status               scan corpus vs cache; report done / stale / missing
-  measure [--force]    submit a Slurm job array for stale/missing datasets (reuses the rest)
-  measure-v2 [--force] submit HVG/cluster-DEG measurement jobs
-  measure-v2-local     run HVG/cluster-DEG jobs locally in one Python process
+  measure [--force]    submit Stage-1 and Stage-2 measurement jobs
+  measure-stage1       submit Stage-1 detection measurement jobs
+  measure-stage2       submit Stage-2 HVG/cluster-DEG measurement jobs
+  measure-stage2-local run Stage-2 jobs locally in one Python process
   ref [--force]        build the Ensembl biotype reference (needs internet)
   build [opts] [--tag] aggregate cached stats + select -> a versioned vocab snapshot
-  build-v2 [opts]      build detection + HVG + cluster-DEG vocabulary
-  refresh [opts]       measure -> wait -> build (one shot)
-  refresh-v2 [opts]    measure + measure-v2 -> wait -> build-v2
+  refresh [opts]       measure -> wait -> build
   diff A B             compare two vocab snapshots (genes added / removed)
   list                 list vocab snapshots
 
-Staleness = stage-1 output missing OR h5ad newer than it. So re-running only
-recomputes changed/new datasets; everything else is reused.
+Staleness is tracked per stage from cache files and input h5ad mtimes, so
+re-running only recomputes changed/new datasets; everything else is reused.
 """
 import argparse
 import gzip
@@ -156,8 +155,20 @@ def _stage1_record(cfg, key, sp, h5ad):
     return {"key": key, "species": sp, "h5ad": h5ad, "out": par, "stale": stale}
 
 
-def selection_v2_measure_signature(cfg):
-    d = cfg.get("select_v2", {})
+def selection_cfg(cfg):
+    """Return the current selection config.
+
+    ``select_v2`` is accepted only as a backward-compatible config key for older
+    scratch smoke configs.
+    """
+    d = cfg.get("selection", cfg.get("select_v2"))
+    if d is None:
+        raise SystemExit("config is missing selection settings")
+    return d
+
+
+def stage2_measure_signature(cfg):
+    d = selection_cfg(cfg)
     payload = {
         "stage2_algorithm_version": STAGE2_ALGORITHM_VERSION,
         "hvg_rule": d.get("hvg_rule", {}),
@@ -170,11 +181,13 @@ def selection_v2_measure_signature(cfg):
 def _stage2_record(cfg, rec):
     out = os.path.join(cfg["_dirs"]["stage2"], rec["key"] + ".parquet")
     meta = os.path.splitext(out)[0] + ".meta.json"
-    sig = selection_v2_measure_signature(cfg)
+    sig = stage2_measure_signature(cfg)
     stale = (not os.path.exists(out)) or (os.path.getmtime(rec["h5ad"]) > os.path.getmtime(out))
     if os.path.exists(meta):
         try:
-            stale = stale or json.load(open(meta)).get("selection_v2_measure_signature") != sig
+            m = json.load(open(meta))
+            old_sig = m.get("stage2_measure_signature", m.get("selection_v2_measure_signature"))
+            stale = stale or old_sig != sig
         except Exception:
             stale = True
     else:
@@ -251,10 +264,12 @@ def cmd_status(cfg, args):
     for sp in SPECIES:
         s = [d for d in ds2 if d["species"] == sp]
         stale = [d for d in s if d["stage2_stale"]]
-        print(f"  {sp:6} v2: {len(s):3} datasets  |  up-to-date {len(s)-len(stale):3}  |  "
+        print(f"  {sp:6} stage2: {len(s):3} datasets  |  up-to-date {len(s)-len(stale):3}  |  "
               f"stale/missing {len(stale):3}")
     tot_stale = [d for d in ds if d["stale"]]
-    print(f"  TOTAL : {len(ds)} datasets, {len(tot_stale)} need (re)compute")
+    tot_stage2_stale = [d for d in ds2 if d["stage2_stale"]]
+    print(f"  TOTAL stage1: {len(ds)} datasets, {len(tot_stale)} need (re)compute")
+    print(f"  TOTAL stage2: {len(ds2)} datasets, {len(tot_stage2_stale)} need (re)compute")
     for sp in SPECIES:
         gs = os.path.join(cfg["_dirs"]["master"], f"gene_summary_{sp}.parquet")
         if os.path.exists(gs):
@@ -266,11 +281,11 @@ def cmd_status(cfg, args):
 
 
 # --------------------------------------------------------------------- measure
-def cmd_measure(cfg, args):
+def cmd_measure_stage1(cfg, args):
     ds = scan_corpus(cfg)
     todo = ds if args.force else [d for d in ds if d["stale"]]
     if not todo:
-        print("nothing to measure (all up-to-date). use --force to recompute.")
+        print("nothing to measure-stage1 (all up-to-date). use --force to recompute.")
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
     man = os.path.join(cfg["_dirs"]["jobs"], f"manifest_{stamp}.tsv")
@@ -294,17 +309,17 @@ set -euo pipefail
     res = subprocess.run(["sbatch", sb], capture_output=True, text=True)
     print(res.stdout.strip() or res.stderr.strip())
     jid = res.stdout.strip().split()[-1] if res.returncode == 0 else None
-    print(f"submitted array of {len(todo)} task(s) [{cfg['slurm']['array_throttle']} concurrent]")
+    print(f"submitted stage1 array of {len(todo)} task(s) [{cfg['slurm']['array_throttle']} concurrent]")
     return jid
 
 
-def cmd_measure_v2(cfg, args):
+def cmd_measure_stage2(cfg, args):
     ds = [_stage2_record(cfg, d) for d in scan_corpus(cfg)]
     todo = ds if args.force else [d for d in ds if d["stage2_stale"]]
     if not todo:
-        print("nothing to measure-v2 (all up-to-date). use --force to recompute.")
+        print("nothing to measure-stage2 (all up-to-date). use --force to recompute.")
         return None
-    sl = cfg.get("slurm_v2", cfg["slurm"])
+    sl = cfg.get("slurm_stage2", cfg.get("slurm_v2", cfg["slurm"]))
     batch_size = getattr(args, "batch_size", None)
     if batch_size is None:
         batch_size = sl.get("batch_size", 1)
@@ -314,18 +329,18 @@ def cmd_measure_v2(cfg, args):
     batch_size = int(batch_size)
     batch_max_cells = int(batch_max_cells or 0)
     if batch_size < 1:
-        raise SystemExit("measure-v2 --batch-size must be >= 1")
+        raise SystemExit("measure-stage2 --batch-size must be >= 1")
     if batch_max_cells < 0:
-        raise SystemExit("measure-v2 --batch-max-cells must be >= 0")
+        raise SystemExit("measure-stage2 --batch-max-cells must be >= 0")
 
     chunks = _pack_stage2_chunks(cfg, todo, batch_size, batch_max_cells)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    chunk_list, _ = _write_stage2_chunk_manifests(cfg, chunks, f"manifest_v2_{stamp}")
-    sb = os.path.join(cfg["_dirs"]["jobs"], f"measure_v2_{stamp}.sbatch")
+    chunk_list, _ = _write_stage2_chunk_manifests(cfg, chunks, f"manifest_stage2_{stamp}")
+    sb = os.path.join(cfg["_dirs"]["jobs"], f"measure_stage2_{stamp}.sbatch")
     q = shlex.quote
     with open(sb, "w") as fh:
         fh.write(f"""#!/bin/bash
-#SBATCH --job-name=efs-v2
+#SBATCH --job-name=efs-stage2
 #SBATCH -p {sl['partition']}
 #SBATCH --time={sl['time']}
 #SBATCH --mem={sl['mem']}
@@ -337,16 +352,20 @@ export OMP_NUM_THREADS={sl['cpus']}
 export OPENBLAS_NUM_THREADS={sl['cpus']}
 export MKL_NUM_THREADS={sl['cpus']}
 CHUNK_MANIFEST=$(sed -n "${{SLURM_ARRAY_TASK_ID}}p" {q(chunk_list)})
-{q(cfg['venv_python'])} {q(os.path.join(HERE, 'worker_v2.py'))} --config {q(cfg['_config_path'])} --manifest "$CHUNK_MANIFEST"
+{q(cfg['venv_python'])} {q(os.path.join(HERE, 'worker_stage2.py'))} --config {q(cfg['_config_path'])} --manifest "$CHUNK_MANIFEST"
 """)
     res = subprocess.run(["sbatch", sb], capture_output=True, text=True)
     print(res.stdout.strip() or res.stderr.strip())
     jid = res.stdout.strip().split()[-1] if res.returncode == 0 else None
     max_cells = batch_max_cells if batch_max_cells > 0 else "off"
-    print(f"submitted v2 array of {len(chunks)} task(s) for {len(todo)} dataset(s) "
+    print(f"submitted stage2 array of {len(chunks)} task(s) for {len(todo)} dataset(s) "
           f"[{sl['array_throttle']} concurrent, batch_size={batch_size}, "
           f"batch_max_cells={max_cells}]")
     return jid
+
+
+def cmd_measure(cfg, args):
+    return [cmd_measure_stage1(cfg, args), cmd_measure_stage2(cfg, args)]
 
 
 def _write_stage2_manifest_file(path, records):
@@ -427,18 +446,18 @@ def _write_stage2_chunk_manifests(cfg, chunks, prefix):
     return chunk_list, chunk_paths
 
 
-def cmd_measure_v2_local(cfg, args):
+def cmd_measure_stage2_local(cfg, args):
     ds = [_stage2_record(cfg, d) for d in scan_corpus(cfg)]
     todo = ds if args.force else [d for d in ds if d["stage2_stale"]]
     if args.limit is not None:
         todo = todo[:args.limit]
     if not todo:
-        print("nothing to measure-v2-local (all up-to-date). use --force to recompute.")
+        print("nothing to measure-stage2-local (all up-to-date). use --force to recompute.")
         return None
-    man = _write_stage2_manifest(cfg, todo, "manifest_v2_local")
-    cmd = [cfg["venv_python"], os.path.join(HERE, "worker_v2.py"),
+    man = _write_stage2_manifest(cfg, todo, "manifest_stage2_local")
+    cmd = [cfg["venv_python"], os.path.join(HERE, "worker_stage2.py"),
            "--config", cfg["_config_path"], "--manifest", man]
-    print(f"running {len(todo)} v2 task(s) locally in one Python process", flush=True)
+    print(f"running {len(todo)} stage2 task(s) locally in one Python process", flush=True)
     subprocess.run(cmd, check=True)
     return None
 
@@ -493,88 +512,8 @@ def aggregate(cfg):
 
 
 # ---------------------------------------------------------------------- select
-def select_snapshot(cfg, f, k, sdet, sq, category_rule, tag):
-    md = cfg["_dirs"]["master"]
-    tag = tag or time.strftime("%Y%m%d-%H%M%S")
-    outdir = os.path.join(cfg["_dirs"]["vocab"], tag)
-    os.makedirs(outdir, exist_ok=True)
-    counts = {}
-    for sp in SPECIES:
-        gs = os.path.join(md, f"gene_summary_{sp}.parquet")
-        det_path = os.path.join(md, f"det_matrix_{sp}.parquet")
-        if not os.path.exists(gs):
-            continue
-        s = pd.read_parquet(gs).set_index("harmonized_id")
-        det = pd.read_parquet(det_path)
-        for c in FLAGCOLS:
-            s[c] = s[c].fillna(False).astype(bool) if c in s else False
-        if "biotype" not in s:
-            s["biotype"] = None
-        bt = s["biotype"].fillna("")
-        s["is_pseudogene"] = s["is_pseudogene"] | bt.str.contains("pseudogene", case=False, na=False)
-        cons = (det >= f).sum(axis=1).reindex(s.index).fillna(0) >= k  # arbitrary f from matrix
-        qbar = s.loc[cons, "max_mean_expr"].quantile(sq) if cons.any() else np.inf
-        strength = (s["max_det"] >= sdet) & (s["max_mean_expr"] >= qbar)
-        s["candidate"] = cons | strength
-        cand = s[s["candidate"]].copy()
-        bt = cand["biotype"].fillna("")
-        cand["veto_narrow"] = cand[NARROW].any(axis=1)
-        cand["veto_wide"] = cand["veto_narrow"] | (bt.ne("protein_coding") & bt.ne(""))
-        unknown = [c for c in category_rule if c not in cand.columns]
-        if unknown:
-            raise SystemExit(f"unknown category_rule flag(s): {unknown}")
-        applied = cand[category_rule].any(axis=1) if category_rule else pd.Series(False, index=cand.index)
-        cand["category_excluded"] = applied
-        cand["selected"] = ~applied
-        cand.index.name = "harmonized_id"
-        cols = (["symbol", "biotype", "selected", "category_excluded", "veto_narrow", "veto_wide",
-                 "n_datasets_present", "max_det", "median_det_present",
-                 "max_mean_expr", "pooled_det"] + FLAGCOLS)
-        cols = [c for c in cols if c in cand.columns]
-        cand[cols].sort_values(["selected", "n_datasets_present", "max_det"],
-                               ascending=False).to_csv(
-            os.path.join(outdir, f"vocab_{sp}.tsv"), sep="\t")
-        counts[sp] = {"candidate": int(len(cand)), "selected": int(cand["selected"].sum())}
-        print(f"  [{sp}] candidate={counts[sp]['candidate']} selected={counts[sp]['selected']}")
-    meta = {"tag": tag, "f": f, "k": k, "strength_det": sdet, "strength_q": sq,
-            "category_rule": category_rule, "created": time.strftime("%Y-%m-%d %H:%M:%S"), "counts": counts}
-    json.dump(meta, open(os.path.join(outdir, "params.json"), "w"), indent=2)
-    latest = os.path.join(cfg["_dirs"]["vocab"], "latest")
-    if os.path.islink(latest) or os.path.exists(latest):
-        os.remove(latest)
-    os.symlink(tag, latest)
-    print(f"-> snapshot {outdir}  (latest -> {tag})")
-
-
-def _select_params(cfg, args):
-    d = cfg["select"]
-    category_rule = d.get("category_rule", d.get("veto", []))
-    if args.veto:
-        category_rule = args.veto.split(",")
-    if args.category_rule:
-        category_rule = args.category_rule.split(",")
-    return (args.f if args.f is not None else d["f"],
-            args.k if args.k is not None else d["k"],
-            d["strength_det"], d["strength_q"],
-            category_rule)
-
-
-def cmd_build(cfg, args):
-    aggregate(cfg)
-    f, k, sdet, sq, category_rule = _select_params(cfg, args)
-    print(f"selecting (f={f}, k={k}, strength={sdet}/q{sq}, category_rule={category_rule or 'none'})")
-    select_snapshot(cfg, f, k, sdet, sq, category_rule, args.tag)
-
-
-def cmd_refresh(cfg, args):
-    jid = cmd_measure(cfg, args)
-    _wait(jid)
-    cmd_build(cfg, args)
-
-
-# --------------------------------------------------------------------- v2 build
-def _select_v2_params(cfg, args):
-    d = cfg["select_v2"]
+def _selection_params(cfg, args):
+    d = selection_cfg(cfg)
     det = d["detection_rule"]
     hvg = d["hvg_rule"]
     deg = d["cluster_deg_rule"]
@@ -619,7 +558,7 @@ def _read_stage2_current(cfg):
                 df[c] = False if c.startswith("selected_") else None
         rows.append(df)
     if missing or stale:
-        print(f"warning: build-v2 using stage2 cache with {stale} stale and {missing} missing dataset(s)")
+        print(f"warning: build using stage2 cache with {stale} stale and {missing} missing dataset(s)")
     if not rows:
         return pd.DataFrame(columns=cols)
     return pd.concat(rows, ignore_index=True)
@@ -659,7 +598,7 @@ def _prepare_category_flags(frame):
     return frame
 
 
-def select_snapshot_v2(cfg, params, tag):
+def select_snapshot(cfg, params, tag):
     aggregate(cfg)
     md = cfg["_dirs"]["master"]
     stage2 = _read_stage2_current(cfg)
@@ -725,10 +664,10 @@ def select_snapshot_v2(cfg, params, tag):
               f"cluster_deg={counts[sp]['cluster_deg']}")
 
     meta = {
-        "policy": "v2",
+        "policy": "current",
         "tag": tag,
-        "select_v2": params,
-        "selection_v2_measure_signature": selection_v2_measure_signature(cfg),
+        "selection": params,
+        "stage2_measure_signature": stage2_measure_signature(cfg),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "counts": counts,
     }
@@ -740,22 +679,20 @@ def select_snapshot_v2(cfg, params, tag):
     print(f"-> snapshot {outdir}  (latest -> {tag})")
 
 
-def cmd_build_v2(cfg, args):
-    params = _select_v2_params(cfg, args)
-    print("selecting v2 "
+def cmd_build(cfg, args):
+    params = _selection_params(cfg, args)
+    print("selecting "
           f"(min_frac={params['min_frac']}, min_dataset_occurrence={params['min_dataset_occurrence']}, "
           f"hvg_min_datasets={params['hvg_min_datasets']}, "
           f"deg_min_datasets={params['deg_min_datasets']}, "
           f"category_rule={params['category_rule'] or 'none'})")
-    select_snapshot_v2(cfg, params, args.tag)
+    select_snapshot(cfg, params, args.tag)
 
 
-def cmd_refresh_v2(cfg, args):
-    jid1 = cmd_measure(cfg, args)
-    jid2 = cmd_measure_v2(cfg, args)
-    _wait(jid1)
-    _wait(jid2)
-    cmd_build_v2(cfg, args)
+def cmd_refresh(cfg, args):
+    for jid in cmd_measure(cfg, args):
+        _wait(jid)
+    cmd_build(cfg, args)
 
 
 # ------------------------------------------------------------------------ diff
@@ -791,14 +728,13 @@ def cmd_list(cfg, args):
             m = json.load(open(p))
             c = m.get("counts", {})
             sel = {sp: c[sp]["selected"] for sp in c}
-            if m.get("policy") == "v2":
-                v2 = m.get("select_v2", {})
-                print(f"  {tag}  v2 min_frac={v2.get('min_frac')} "
-                      f"min_dataset_occurrence={v2.get('min_dataset_occurrence')} "
-                      f"category_rule={v2.get('category_rule') or 'none'}  selected={sel}")
+            if m.get("policy") in {"current", "v2"} or "selection" in m or "select_v2" in m:
+                params = m.get("selection", m.get("select_v2", {}))
+                print(f"  {tag}  min_frac={params.get('min_frac')} "
+                      f"min_dataset_occurrence={params.get('min_dataset_occurrence')} "
+                      f"category_rule={params.get('category_rule') or 'none'}  selected={sel}")
             else:
-                category_rule = m.get("category_rule", m.get("veto", []))
-                print(f"  {tag}  f={m['f']} k={m['k']} category_rule={category_rule or 'none'}  selected={sel}")
+                print(f"  {tag}  legacy selection  selected={sel}")
 
 
 # ------------------------------------------------------------ biotype reference
@@ -876,30 +812,27 @@ def main():
     ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"))
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
-    m = sub.add_parser("measure"); m.add_argument("--force", action="store_true")
+
     def add_stage2_batch_opts(p):
         p.add_argument("--batch-size", type=int,
-                       help="datasets per v2 array task; default from slurm_v2.batch_size")
+                       help="datasets per stage2 array task; default from slurm_stage2.batch_size")
         p.add_argument("--batch-max-cells", type=int,
-                       help="max total cells per v2 array task; 0 disables this guard")
+                       help="max total cells per stage2 array task; 0 disables this guard")
 
-    mv2 = sub.add_parser("measure-v2")
-    mv2.add_argument("--force", action="store_true")
-    add_stage2_batch_opts(mv2)
-    mv2l = sub.add_parser("measure-v2-local")
-    mv2l.add_argument("--force", action="store_true")
-    mv2l.add_argument("--limit", type=int, help="run only the first N stale/missing v2 datasets")
+    m = sub.add_parser("measure")
+    m.add_argument("--force", action="store_true")
+    add_stage2_batch_opts(m)
+    m1 = sub.add_parser("measure-stage1")
+    m1.add_argument("--force", action="store_true")
+    m2 = sub.add_parser("measure-stage2")
+    m2.add_argument("--force", action="store_true")
+    add_stage2_batch_opts(m2)
+    m2l = sub.add_parser("measure-stage2-local")
+    m2l.add_argument("--force", action="store_true")
+    m2l.add_argument("--limit", type=int, help="run only the first N stale/missing stage2 datasets")
     r = sub.add_parser("ref"); r.add_argument("--force", action="store_true")
 
-    def add_build_opts(p):
-        p.add_argument("--f", type=float); p.add_argument("--k", type=int)
-        p.add_argument("--category-rule")
-        p.add_argument("--veto", help=argparse.SUPPRESS)  # backward-compatible alias
-        p.add_argument("--tag")
-        p.add_argument("--force", action="store_true")
-    add_build_opts(sub.add_parser("build"))
-    add_build_opts(sub.add_parser("refresh"))
-    def add_build_v2_opts(p):
+    def add_build_opts(p, include_force=False):
         p.add_argument("--min-frac", type=float)
         p.add_argument("--min-dataset-occurrence", type=int)
         p.add_argument("--hvg-min-datasets", type=int)
@@ -907,20 +840,21 @@ def main():
         p.add_argument("--category-rule")
         p.add_argument("--veto", help=argparse.SUPPRESS)
         p.add_argument("--tag")
-        p.add_argument("--force", action="store_true")
-    add_build_v2_opts(sub.add_parser("build-v2"))
-    rv2 = sub.add_parser("refresh-v2")
-    add_build_v2_opts(rv2)
-    add_stage2_batch_opts(rv2)
+        if include_force:
+            p.add_argument("--force", action="store_true")
+    add_build_opts(sub.add_parser("build"))
+    refresh = sub.add_parser("refresh")
+    add_build_opts(refresh, include_force=True)
+    add_stage2_batch_opts(refresh)
     d = sub.add_parser("diff"); d.add_argument("a"); d.add_argument("b")
     sub.add_parser("list")
 
     args = ap.parse_args()
     cfg = load_config(args.config)
-    {"status": cmd_status, "measure": cmd_measure, "measure-v2": cmd_measure_v2,
-     "measure-v2-local": cmd_measure_v2_local,
-     "ref": cmd_ref, "build": cmd_build, "build-v2": cmd_build_v2,
-     "refresh": cmd_refresh, "refresh-v2": cmd_refresh_v2,
+    {"status": cmd_status, "measure": cmd_measure,
+     "measure-stage1": cmd_measure_stage1, "measure-stage2": cmd_measure_stage2,
+     "measure-stage2-local": cmd_measure_stage2_local,
+     "ref": cmd_ref, "build": cmd_build, "refresh": cmd_refresh,
      "diff": cmd_diff, "list": cmd_list}[args.cmd](cfg, args)
 
 

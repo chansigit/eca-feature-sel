@@ -17,7 +17,7 @@ slurm:
   cpus: 1
   array_throttle: 100        # max concurrent array tasks (be nice to the scheduler)
 
-slurm_v2:
+slurm_stage2:
   partition: normal
   time: "04:00:00"
   mem: 32GB
@@ -27,17 +27,8 @@ slurm_v2:
   batch_max_cells: 50000     # keep larger stage-2 datasets isolated; 0 disables
 
 # Default selection policy. Everything here is overridable on the `build` CLI.
-# The category rule removes selected categories after count-driven candidate selection.
-select:
-  f: 0.01                    # per-dataset detection floor (one of 0.005/0.01/0.02/0.05)
-  k: 3                       # consistency arm: min #datasets a gene must clear f in
-  strength_det: 0.25         # strength arm: per-dataset detection floor
-  strength_q: 0.90           # strength arm: max_mean_expr quantile bar
-  category_rule: [is_pseudogene]
-
-# Planned selection policy. This is the design target for the next implementation
-# pass; the current build command still uses the legacy select section above.
-select_v2:
+# The category rule removes selected categories after data-driven candidate selection.
+selection:
   detection_rule:
     min_frac: 0.01           # gene must be detected in at least this fraction of cells
     min_dataset_occurrence: 10  # min datasets where the gene clears min_frac

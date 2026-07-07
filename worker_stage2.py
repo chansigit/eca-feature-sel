@@ -125,14 +125,14 @@ def _rank_genes_array(uns, key, group):
 
 
 def _hvg_needs_scanpy(adata, cfg):
-    rule = cfg["select_v2"]["hvg_rule"]
+    rule = featuresel.selection_cfg(cfg)["hvg_rule"]
     layer = rule.get("layer", "counts")
     n_top = min(int(rule.get("n_top_genes", 3000)), adata.n_vars)
     return layer in adata.layers and n_top > 0 and adata.n_obs > 0 and adata.n_vars > 0
 
 
 def _run_hvg(adata, cfg, meta, phase_times):
-    rule = cfg["select_v2"]["hvg_rule"]
+    rule = featuresel.selection_cfg(cfg)["hvg_rule"]
     layer = rule.get("layer", "counts")
     if layer not in adata.layers:
         meta["hvg_error"] = f"layer {layer!r} not found"
@@ -176,7 +176,8 @@ def _run_hvg(adata, cfg, meta, phase_times):
 
 
 def _run_cluster_deg(adata, cfg, meta, phase_times):
-    rule = cfg["select_v2"]["cluster_deg_rule"]
+    selection = featuresel.selection_cfg(cfg)
+    rule = selection["cluster_deg_rule"]
     obs_key = _choose_obs_key(adata, rule.get("obs_key_priority", []))
     meta["deg_obs_key"] = obs_key
     if obs_key is None:
@@ -201,7 +202,8 @@ def _run_cluster_deg(adata, cfg, meta, phase_times):
         meta["deg_status"] = "no_eligible_groups"
         return pd.DataFrame(columns=["harmonized_id"])
 
-    layer = cfg["select_v2"]["hvg_rule"].get("layer", "counts")
+    hvg_rule = selection["hvg_rule"]
+    layer = hvg_rule.get("layer", "counts")
     if layer not in ad.layers:
         meta["deg_error"] = f"layer {layer!r} not found"
         return pd.DataFrame(columns=["harmonized_id"])
@@ -214,7 +216,7 @@ def _run_cluster_deg(adata, cfg, meta, phase_times):
     ad = ad[:, candidate_mask].copy()
     ad.X = ad.layers[layer].copy()
     ad.uns.pop("log1p", None)
-    sc.pp.normalize_total(ad, target_sum=cfg["select_v2"]["hvg_rule"].get("normalize_target_sum", 10000))
+    sc.pp.normalize_total(ad, target_sum=hvg_rule.get("normalize_target_sum", 10000))
     sc.pp.log1p(ad)
 
     top_n = int(rule.get("top_n_per_cluster", 100))
@@ -310,7 +312,7 @@ def compute(cfg, h5ad, species, key, out):
         "species": species,
         "h5ad": h5ad,
         "h5ad_mtime": os.path.getmtime(h5ad),
-        "selection_v2_measure_signature": featuresel.selection_v2_measure_signature(cfg),
+        "stage2_measure_signature": featuresel.stage2_measure_signature(cfg),
     }
     gene_key = "gene_id_harmonized"
     ad = _get_anndata(phase_times)
