@@ -54,6 +54,7 @@ $PY featuresel.py status             # what's done / stale / missing
 $PY featuresel.py ref                # one-time: Ensembl biotype reference (needs internet)
 $PY featuresel.py measure            # Slurm job array over stale/new datasets (reuses rest)
 $PY featuresel.py measure-v2         # Slurm job array for HVG + cluster-DEG cache
+$PY featuresel.py measure-v2 --batch-size 4 --batch-max-cells 50000  # override chunking
 $PY featuresel.py measure-v2-local --limit 4    # local smoke/profiling run, one Python process
 $PY featuresel.py build-v2           # union detection/HVG/cluster-DEG -> snapshot
 $PY featuresel.py refresh-v2         # measure + measure-v2 -> wait -> build-v2
@@ -96,6 +97,9 @@ mouse.tsv       explicit mouse input dataset list: sample_key, species, h5ad
   the next build automatically.
 - Stage-1 jobs are tiny (streaming bincount, <1 GB peak). Stage-2 jobs load one
   dataset at a time with Scanpy and use the separate `slurm_v2` resources.
+- `measure-v2` can pack multiple small datasets into one Slurm array task via
+  `slurm_v2.batch_size` and `slurm_v2.batch_max_cells`. This reduces repeated
+  Python/Scanpy startup cost while keeping large datasets isolated.
 - Stage-2 meta JSON files include `phase_times_sec` so import, read, HVG, and
   cluster-DEG bottlenecks can be profiled after a run. `measure-v2-local` processes
   multiple datasets in one Python process to avoid repeated Scanpy import overhead

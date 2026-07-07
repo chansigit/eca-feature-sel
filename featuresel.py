@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.request
@@ -303,13 +304,25 @@ def cmd_measure_v2(cfg, args):
     if not todo:
         print("nothing to measure-v2 (all up-to-date). use --force to recompute.")
         return None
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    man = os.path.join(cfg["_dirs"]["jobs"], f"manifest_v2_{stamp}.tsv")
-    with open(man, "w") as fh:
-        for d in todo:
-            fh.write(f"{d['key']}\t{d['species']}\t{d['h5ad']}\t{d['stage2_out']}\n")
     sl = cfg.get("slurm_v2", cfg["slurm"])
+    batch_size = getattr(args, "batch_size", None)
+    if batch_size is None:
+        batch_size = sl.get("batch_size", 1)
+    batch_max_cells = getattr(args, "batch_max_cells", None)
+    if batch_max_cells is None:
+        batch_max_cells = sl.get("batch_max_cells", 0)
+    batch_size = int(batch_size)
+    batch_max_cells = int(batch_max_cells or 0)
+    if batch_size < 1:
+        raise SystemExit("measure-v2 --batch-size must be >= 1")
+    if batch_max_cells < 0:
+        raise SystemExit("measure-v2 --batch-max-cells must be >= 0")
+
+    chunks = _pack_stage2_chunks(cfg, todo, batch_size, batch_max_cells)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    chunk_list, _ = _write_stage2_chunk_manifests(cfg, chunks, f"manifest_v2_{stamp}")
     sb = os.path.join(cfg["_dirs"]["jobs"], f"measure_v2_{stamp}.sbatch")
+    q = shlex.quote
     with open(sb, "w") as fh:
         fh.write(f"""#!/bin/bash
 #SBATCH --job-name=efs-v2
@@ -317,28 +330,101 @@ def cmd_measure_v2(cfg, args):
 #SBATCH --time={sl['time']}
 #SBATCH --mem={sl['mem']}
 #SBATCH --cpus-per-task={sl['cpus']}
-#SBATCH --array=1-{len(todo)}%{sl['array_throttle']}
+#SBATCH --array=1-{len(chunks)}%{sl['array_throttle']}
 #SBATCH --output={cfg['_dirs']['logs']}/%A_%a.out
 set -euo pipefail
 export OMP_NUM_THREADS={sl['cpus']}
 export OPENBLAS_NUM_THREADS={sl['cpus']}
 export MKL_NUM_THREADS={sl['cpus']}
-{cfg['venv_python']} {HERE}/worker_v2.py --config {cfg['_config_path']} --manifest {man} --index $SLURM_ARRAY_TASK_ID
+CHUNK_MANIFEST=$(sed -n "${{SLURM_ARRAY_TASK_ID}}p" {q(chunk_list)})
+{q(cfg['venv_python'])} {q(os.path.join(HERE, 'worker_v2.py'))} --config {q(cfg['_config_path'])} --manifest "$CHUNK_MANIFEST"
 """)
     res = subprocess.run(["sbatch", sb], capture_output=True, text=True)
     print(res.stdout.strip() or res.stderr.strip())
     jid = res.stdout.strip().split()[-1] if res.returncode == 0 else None
-    print(f"submitted v2 array of {len(todo)} task(s) [{sl['array_throttle']} concurrent]")
+    max_cells = batch_max_cells if batch_max_cells > 0 else "off"
+    print(f"submitted v2 array of {len(chunks)} task(s) for {len(todo)} dataset(s) "
+          f"[{sl['array_throttle']} concurrent, batch_size={batch_size}, "
+          f"batch_max_cells={max_cells}]")
     return jid
+
+
+def _write_stage2_manifest_file(path, records):
+    with open(path, "w") as fh:
+        for d in records:
+            fh.write(f"{d['key']}\t{d['species']}\t{d['h5ad']}\t{d['stage2_out']}\n")
 
 
 def _write_stage2_manifest(cfg, todo, prefix):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     man = os.path.join(cfg["_dirs"]["jobs"], f"{prefix}_{stamp}.tsv")
-    with open(man, "w") as fh:
-        for d in todo:
-            fh.write(f"{d['key']}\t{d['species']}\t{d['h5ad']}\t{d['stage2_out']}\n")
+    _write_stage2_manifest_file(man, todo)
     return man
+
+
+def _stage1_meta_n_cells(cfg, key):
+    path = os.path.join(cfg["_dirs"]["stage1"], key + ".meta.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            n = json.load(fh).get("n_cells")
+        return int(n) if n is not None else None
+    except Exception:
+        return None
+
+
+def _record_n_cells(cfg, rec):
+    n = _stage1_meta_n_cells(cfg, rec["key"])
+    if n is not None:
+        return n
+    info = _h5ad_info(rec["h5ad"])
+    return info["n_obs"] if info is not None else None
+
+
+def _pack_stage2_chunks(cfg, records, batch_size, batch_max_cells=0):
+    """Pack small stage-2 datasets into one worker process.
+
+    The worker still processes one dataset at a time; this only amortizes Python
+    and Scanpy startup cost. ``batch_max_cells`` keeps large datasets isolated.
+    A value of 0 disables the cell-count packing guard.
+    """
+    if batch_size <= 1:
+        return [[r] for r in records]
+
+    max_cells = int(batch_max_cells or 0)
+    chunks, cur, cur_cells = [], [], 0
+    for rec in records:
+        n_cells = _record_n_cells(cfg, rec)
+        est_cells = int(n_cells) if n_cells is not None else (max_cells if max_cells > 0 else 0)
+        would_exceed_count = len(cur) >= batch_size
+        would_exceed_cells = bool(max_cells > 0 and cur and cur_cells + est_cells > max_cells)
+        if would_exceed_count or would_exceed_cells:
+            chunks.append(cur)
+            cur, cur_cells = [], 0
+
+        cur.append(rec)
+        cur_cells += est_cells
+        if max_cells > 0 and est_cells >= max_cells:
+            chunks.append(cur)
+            cur, cur_cells = [], 0
+
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _write_stage2_chunk_manifests(cfg, chunks, prefix):
+    chunk_paths = []
+    for i, chunk in enumerate(chunks, 1):
+        path = os.path.join(cfg["_dirs"]["jobs"], f"{prefix}_chunk_{i:04d}.tsv")
+        _write_stage2_manifest_file(path, chunk)
+        chunk_paths.append(path)
+    chunk_list = os.path.join(cfg["_dirs"]["jobs"], f"{prefix}_chunks.tsv")
+    with open(chunk_list, "w") as fh:
+        for path in chunk_paths:
+            fh.write(path + "\n")
+    return chunk_list, chunk_paths
 
 
 def cmd_measure_v2_local(cfg, args):
@@ -791,7 +877,15 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     m = sub.add_parser("measure"); m.add_argument("--force", action="store_true")
-    mv2 = sub.add_parser("measure-v2"); mv2.add_argument("--force", action="store_true")
+    def add_stage2_batch_opts(p):
+        p.add_argument("--batch-size", type=int,
+                       help="datasets per v2 array task; default from slurm_v2.batch_size")
+        p.add_argument("--batch-max-cells", type=int,
+                       help="max total cells per v2 array task; 0 disables this guard")
+
+    mv2 = sub.add_parser("measure-v2")
+    mv2.add_argument("--force", action="store_true")
+    add_stage2_batch_opts(mv2)
     mv2l = sub.add_parser("measure-v2-local")
     mv2l.add_argument("--force", action="store_true")
     mv2l.add_argument("--limit", type=int, help="run only the first N stale/missing v2 datasets")
@@ -815,7 +909,9 @@ def main():
         p.add_argument("--tag")
         p.add_argument("--force", action="store_true")
     add_build_v2_opts(sub.add_parser("build-v2"))
-    add_build_v2_opts(sub.add_parser("refresh-v2"))
+    rv2 = sub.add_parser("refresh-v2")
+    add_build_v2_opts(rv2)
+    add_stage2_batch_opts(rv2)
     d = sub.add_parser("diff"); d.add_argument("a"); d.add_argument("b")
     sub.add_parser("list")
 

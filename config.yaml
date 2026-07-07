@@ -23,6 +23,8 @@ slurm_v2:
   mem: 32GB
   cpus: 4
   array_throttle: 20
+  batch_size: 4              # run up to this many small datasets per array task
+  batch_max_cells: 50000     # keep larger stage-2 datasets isolated; 0 disables
 
 # Default selection policy. Everything here is overridable on the `build` CLI.
 # The category rule removes selected categories after count-driven candidate selection.
