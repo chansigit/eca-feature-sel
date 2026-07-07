@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -51,6 +52,42 @@ def _frac_nonzero(x):
     if sparse.issparse(nz):
         return np.asarray(nz.mean(axis=0)).ravel()
     return np.asarray(nz).mean(axis=0)
+
+
+def _deg_candidate_gene_mask(ad, group_labels, groups, rule, layer):
+    x = ad.layers[layer]
+    min_pct = float(rule.get("min_pct_in_cluster", 0.10))
+    min_diff = float(rule.get("min_pct_difference", 0.05))
+    labels = group_labels.astype(str).to_numpy()
+    groups = [str(g) for g in groups]
+    if sparse.issparse(x):
+        xb = x.copy()
+        xb.data = np.ones_like(xb.data, dtype=np.float32)
+        xb = xb.tocsr()
+    else:
+        xb = (np.asarray(x) > 0).astype(np.float32)
+
+    group_to_row = {g: i for i, g in enumerate(groups)}
+    codes = np.array([group_to_row.get(x, -1) for x in labels], dtype=np.int64)
+    keep = codes >= 0
+    if not keep.any():
+        return np.zeros(ad.n_vars, dtype=bool)
+
+    design = sparse.csr_matrix(
+        (np.ones(int(keep.sum()), dtype=np.float32), (codes[keep], np.flatnonzero(keep))),
+        shape=(len(groups), ad.n_obs),
+    )
+    group_counts = np.asarray(design.sum(axis=1)).ravel()
+    other_counts = ad.n_obs - group_counts
+    valid_groups = (group_counts > 0) & (other_counts > 0)
+    if not valid_groups.any():
+        return np.zeros(ad.n_vars, dtype=bool)
+
+    counts_in = (design @ xb).toarray()
+    total = np.asarray(xb.sum(axis=0)).ravel()
+    pct_in = counts_in[valid_groups] / group_counts[valid_groups, None]
+    pct_out = (total[None, :] - counts_in[valid_groups]) / other_counts[valid_groups, None]
+    return ((pct_in >= min_pct) & ((pct_in - pct_out) >= min_diff)).any(axis=0)
 
 
 def _rank_genes_array(uns, key, group):
@@ -135,6 +172,12 @@ def _run_cluster_deg(adata, cfg, meta):
     if layer not in ad.layers:
         meta["deg_error"] = f"layer {layer!r} not found"
         return pd.DataFrame(columns=["harmonized_id"])
+    candidate_mask = _deg_candidate_gene_mask(ad, ad.obs["_efs_group"], groups, rule, layer)
+    meta["deg_n_candidate_genes"] = int(candidate_mask.sum())
+    if not candidate_mask.any():
+        meta["deg_status"] = "no_candidate_genes_after_prevalence_filter"
+        return pd.DataFrame(columns=["harmonized_id"])
+    ad = ad[:, candidate_mask].copy()
     ad.X = ad.layers[layer].copy()
     ad.uns.pop("log1p", None)
     sc.pp.normalize_total(ad, target_sum=cfg["select_v2"]["hvg_rule"].get("normalize_target_sum", 10000))
@@ -226,6 +269,8 @@ def _run_cluster_deg(adata, cfg, meta):
 
 
 def compute(cfg, h5ad, species, key, out):
+    t0 = time.perf_counter()
+    phase_times = {}
     meta = {
         "sample_key": key,
         "species": species,
@@ -235,6 +280,8 @@ def compute(cfg, h5ad, species, key, out):
     }
     gene_key = "gene_id_harmonized"
     adata = sc.read_h5ad(h5ad)
+    phase_times["read_h5ad_sec"] = time.perf_counter() - t0
+    t = time.perf_counter()
     if gene_key not in adata.var:
         raise SystemExit(f"{key}: var.{gene_key} not found")
     hids, mapped = _normalize_ids(adata.var[gene_key].to_numpy())
@@ -247,9 +294,15 @@ def compute(cfg, h5ad, species, key, out):
     adata = adata[:, mapped].copy()
     adata.var["_efs_harmonized_id"] = hids[mapped]
     adata.var_names = [f"var_{i}" for i in range(adata.n_vars)]
+    phase_times["prepare_sec"] = time.perf_counter() - t
 
+    t = time.perf_counter()
     hvg = _run_hvg(adata, cfg, meta)
+    phase_times["hvg_sec"] = time.perf_counter() - t
+    t = time.perf_counter()
     deg = _run_cluster_deg(adata, cfg, meta)
+    phase_times["cluster_deg_sec"] = time.perf_counter() - t
+    t = time.perf_counter()
     hvg = hvg.set_index("harmonized_id") if "harmonized_id" in hvg else pd.DataFrame()
     deg = deg.set_index("harmonized_id") if "harmonized_id" in deg else pd.DataFrame()
     idx = hvg.index.union(deg.index)
@@ -270,6 +323,9 @@ def compute(cfg, h5ad, species, key, out):
     tmp = out + ".tmp"
     res.to_parquet(tmp, index=False)
     os.replace(tmp, out)
+    phase_times["write_sec"] = time.perf_counter() - t
+    phase_times["total_after_import_sec"] = time.perf_counter() - t0
+    meta["phase_times_sec"] = {k: round(float(v), 3) for k, v in phase_times.items()}
     meta["n_genes_harmonized"] = int(len(set(adata.var["_efs_harmonized_id"])))
     meta["n_hvg_genes"] = int(res["selected_hvg"].sum()) if "selected_hvg" in res else 0
     meta["n_cluster_deg_genes"] = int(res["selected_cluster_deg"].sum()) if "selected_cluster_deg" in res else 0
@@ -291,10 +347,12 @@ def main():
     cfg = featuresel.load_config(a.config)
     if a.manifest:
         lines = [ln for ln in open(a.manifest).read().splitlines() if ln.strip()]
-        key, species, h5ad, out = lines[a.index - 1].split("\t")
+        selected = [lines[a.index - 1]] if a.index else lines
     else:
-        key, species, h5ad, out = a.sample_key, a.species, a.h5ad, a.out
-    compute(cfg, h5ad, species, key, out)
+        selected = ["\t".join([a.sample_key, a.species, a.h5ad, a.out])]
+    for line in selected:
+        key, species, h5ad, out = line.split("\t")
+        compute(cfg, h5ad, species, key, out)
 
 
 if __name__ == "__main__":

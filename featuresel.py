@@ -10,6 +10,7 @@ Subcommands:
   status               scan corpus vs cache; report done / stale / missing
   measure [--force]    submit a Slurm job array for stale/missing datasets (reuses the rest)
   measure-v2 [--force] submit HVG/cluster-DEG measurement jobs
+  measure-v2-local     run HVG/cluster-DEG jobs locally in one Python process
   ref [--force]        build the Ensembl biotype reference (needs internet)
   build [opts] [--tag] aggregate cached stats + select -> a versioned vocab snapshot
   build-v2 [opts]      build detection + HVG + cluster-DEG vocabulary
@@ -44,6 +45,7 @@ NARROW = ["is_OR", "is_vomeronasal", "is_taste",
           "is_IG_V", "is_IG_D", "is_IG_J", "is_TR_V", "is_TR_D", "is_TR_J"]
 FLAGCOLS = NARROW + ["is_pseudogene", "is_IG_C", "is_TR_C", "is_mt", "is_hb", "is_ribo", "is_sex"]
 SPECIES = ("human", "mouse")
+STAGE2_ALGORITHM_VERSION = 2
 
 
 # ---------------------------------------------------------------- config / paths
@@ -156,6 +158,7 @@ def _stage1_record(cfg, key, sp, h5ad):
 def selection_v2_measure_signature(cfg):
     d = cfg.get("select_v2", {})
     payload = {
+        "stage2_algorithm_version": STAGE2_ALGORITHM_VERSION,
         "hvg_rule": d.get("hvg_rule", {}),
         "cluster_deg_rule": d.get("cluster_deg_rule", {}),
     }
@@ -327,6 +330,31 @@ export MKL_NUM_THREADS={sl['cpus']}
     jid = res.stdout.strip().split()[-1] if res.returncode == 0 else None
     print(f"submitted v2 array of {len(todo)} task(s) [{sl['array_throttle']} concurrent]")
     return jid
+
+
+def _write_stage2_manifest(cfg, todo, prefix):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    man = os.path.join(cfg["_dirs"]["jobs"], f"{prefix}_{stamp}.tsv")
+    with open(man, "w") as fh:
+        for d in todo:
+            fh.write(f"{d['key']}\t{d['species']}\t{d['h5ad']}\t{d['stage2_out']}\n")
+    return man
+
+
+def cmd_measure_v2_local(cfg, args):
+    ds = [_stage2_record(cfg, d) for d in scan_corpus(cfg)]
+    todo = ds if args.force else [d for d in ds if d["stage2_stale"]]
+    if args.limit is not None:
+        todo = todo[:args.limit]
+    if not todo:
+        print("nothing to measure-v2-local (all up-to-date). use --force to recompute.")
+        return None
+    man = _write_stage2_manifest(cfg, todo, "manifest_v2_local")
+    cmd = [cfg["venv_python"], os.path.join(HERE, "worker_v2.py"),
+           "--config", cfg["_config_path"], "--manifest", man]
+    print(f"running {len(todo)} v2 task(s) locally in one Python process", flush=True)
+    subprocess.run(cmd, check=True)
+    return None
 
 
 def _wait(jid):
@@ -764,6 +792,9 @@ def main():
     sub.add_parser("status")
     m = sub.add_parser("measure"); m.add_argument("--force", action="store_true")
     mv2 = sub.add_parser("measure-v2"); mv2.add_argument("--force", action="store_true")
+    mv2l = sub.add_parser("measure-v2-local")
+    mv2l.add_argument("--force", action="store_true")
+    mv2l.add_argument("--limit", type=int, help="run only the first N stale/missing v2 datasets")
     r = sub.add_parser("ref"); r.add_argument("--force", action="store_true")
 
     def add_build_opts(p):
@@ -791,6 +822,7 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)
     {"status": cmd_status, "measure": cmd_measure, "measure-v2": cmd_measure_v2,
+     "measure-v2-local": cmd_measure_v2_local,
      "ref": cmd_ref, "build": cmd_build, "build-v2": cmd_build_v2,
      "refresh": cmd_refresh, "refresh-v2": cmd_refresh_v2,
      "diff": cmd_diff, "list": cmd_list}[args.cmd](cfg, args)
