@@ -7,7 +7,7 @@ inputs_tsv:                                                  # sample_key/specie
   # - human.tsv   # old sc-curation corpus: no var.highly_variable, needs hvg.compute: true
 cache_root:  /scratch/users/chensj16/eca-feature-sel/cache   # all computed results (reused)
 venv_python: /scratch/users/chensj16/venvs/dl2025/.venv/bin/python
-ensembl_release: "112"                                       # for the biotype reference
+ensembl_release: "116"                                       # for the biotype reference
 
 slurm:
   partition: normal
@@ -46,7 +46,7 @@ selection:
   hvg_source: union
   # A gene passes in a group when score >= s_min (standardized variance: 1 = as
   # variable as a typical gene of that expression level) and rank <= n_max (cap).
-  s_min: 1.5
+  s_min: 1.3
   n_max: 3000
   min_lineage_cells: 200     # ignore smaller lineages (>= hvg.min_lineage_cells)
   min_lineages: 1            # gene must pass in this many lineages to vote that way
@@ -56,8 +56,13 @@ selection:
   # fallback. See cache/vocab/<tag>/thresholds_{sp}.tsv for the tuning table.
   hvg_min_datasets:
     protein_coding: 3
-    lncRNA: 10
-    default: 10
+    default: 10              # lncRNA and everything else
 
-  category_keep: []          # whitelist: force-include, e.g. [is_mt]
-  category_drop: [is_pseudogene]   # blacklist: exclude; keep wins over drop
+  # Whitelist / blacklist, applied last; keys are is_* flags or exact biotypes;
+  # keep wins over drop. For a foundation-model vocabulary:
+  #   keep  immune constant genes (isotype / TCR lineage markers) and sex genes
+  #   drop  pseudogenes (multi-mapping), V/D/J segments (clonotype, not cell
+  #         state), small RNAs (poly-A capture artefacts), TEC (unconfirmed loci)
+  category_keep: [is_IG_C, is_TR_C, is_sex]
+  category_drop: [is_pseudogene, is_IG_V, is_IG_D, is_IG_J, is_TR_V, is_TR_D, is_TR_J,
+                  TEC, miRNA, snoRNA, snRNA, scaRNA, misc_RNA, rRNA, Mt_tRNA, Mt_rRNA, ribozyme]

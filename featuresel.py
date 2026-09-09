@@ -266,11 +266,17 @@ def _annotate(cfg, sp, t):
     return t
 
 
-def _flag_any(t, flags):
-    unknown = [c for c in flags if c not in t.columns]
-    if unknown:
-        raise SystemExit(f"unknown category flag(s): {unknown} (available: {FLAGCOLS})")
-    return t[flags].any(axis=1) if flags else pd.Series(False, index=t.index)
+def _flag_any(t, keys):
+    """Genes in any of the categories; a key is an is_* flag or an Ensembl biotype."""
+    seen = set(t["biotype"].dropna()) if "biotype" in t else set()
+    for k in keys:
+        if k not in FLAGCOLS and k not in seen:
+            print(f"    warning: category key {k!r} matches no gene "
+                  f"(not an is_* flag, not a biotype in this corpus)")
+    m = pd.Series(False, index=t.index)
+    for k in keys:
+        m |= _category_mask(t, k)
+    return m
 
 
 def _category_mask(t, key):
@@ -412,6 +418,10 @@ def cmd_build(cfg, args):
         t[[c for c in cols if c in t]].sort_values(
             ["selected", "n_datasets_hvg", "pooled_det"], ascending=False
         ).to_csv(os.path.join(outdir, f"vocab_{sp}.tsv"), sep="\t")
+        # the deliverable: just the selected genes
+        t.loc[t["selected"], ["symbol", "biotype", "n_datasets_hvg"]].sort_values(
+            "n_datasets_hvg", ascending=False
+        ).to_csv(os.path.join(outdir, f"genes_{sp}.tsv"), sep="\t")
         # tuning aids: gene counts per biotype at a range of dataset thresholds, and
         # the whole selection re-run at a range of s_min
         _threshold_table(t).to_csv(os.path.join(outdir, f"thresholds_{sp}.tsv"),
@@ -500,6 +510,30 @@ def _add_flags(df, sp):
     return df
 
 
+MGI_URL = "https://www.informatics.jax.org/downloads/reports/MRK_List2.rpt"
+
+
+def _mgi_biotype(feature):
+    """MGI 'Feature Type' -> Ensembl-style biotype (protein_coding, lncRNA, pseudogene, ...)."""
+    f = feature.lower()
+    if "protein coding" in f:
+        return "protein_coding"
+    if "lncrna" in f or "lincrna" in f:
+        return "lncRNA"
+    if "pseudogene" in f:
+        return "pseudogene"
+    return re.sub(r"\s+", "_", re.sub(r"\s+gene$", "", feature.strip()))  # keeps rRNA/miRNA casing
+
+
+def _parse_mgi(path):
+    """Genes the rsi harmonization could only key by MGI accession (no Ensembl id)."""
+    m = pd.read_csv(path, sep="\t", dtype=str, usecols=["MGI Accession ID", "Marker Symbol",
+                                                         "Marker Type", "Feature Type"])
+    m = m[m["Marker Type"].isin(["Gene", "Pseudogene"])]
+    return pd.DataFrame({"harmonized_id": m["MGI Accession ID"], "symbol": m["Marker Symbol"],
+                         "biotype": m["Feature Type"].fillna("").map(_mgi_biotype)})
+
+
 def cmd_ref(cfg, args):
     rel = cfg["ensembl_release"]
     urls = {
@@ -515,7 +549,14 @@ def cmd_ref(cfg, args):
         if not os.path.exists(gz):
             print(f"[{sp}] downloading {url}")
             urllib.request.urlretrieve(url, gz)
-        df = _add_flags(_parse_gtf(gz), sp)
+        df = _parse_gtf(gz)
+        if sp == "mouse":
+            rpt = os.path.join(cfg["_dirs"]["ref"], os.path.basename(MGI_URL))
+            if not os.path.exists(rpt):
+                print(f"[{sp}] downloading {MGI_URL}")
+                urllib.request.urlretrieve(MGI_URL, rpt)
+            df = pd.concat([df, _parse_mgi(rpt)], ignore_index=True).drop_duplicates("harmonized_id")
+        df = _add_flags(df, sp)
         df.to_parquet(out, index=False)
         print(f"[{sp}] genes={len(df)} protein_coding={int(df['is_protein_coding'].sum())} -> {out}")
 

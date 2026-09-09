@@ -62,20 +62,36 @@ policy knobs without changing the vocabulary much, and cost most of the compute.
    ```yaml
    hvg_min_datasets:
      protein_coding: 3      # first match wins, so narrow keys go on top
-     lncRNA: 10
-     default: 10
+     default: 10            # lncRNA and everything else
    ```
 
    Keys are `is_*` flags or exact Ensembl biotypes; `default` covers the rest.
    The resolved threshold is written per gene as `min_datasets_required`.
-2. **Category keep (whitelist)** — a gene matching any `category_keep` flag is
+2. **Category keep (whitelist)** — a gene matching any `category_keep` key is
    forced in even if it missed its threshold, and survives the drop list.
-3. **Category drop (blacklist)** — a gene matching any `category_drop` flag is
-   removed (default: `is_pseudogene`).
+3. **Category drop (blacklist)** — a gene matching any `category_drop` key is
+   removed.
+
+Keys for keep/drop are `is_*` flags or exact biotypes. The shipped lists are
+tuned for a foundation-model vocabulary:
+
+| | keys | why |
+|---|---|---|
+| keep | `is_IG_C`, `is_TR_C`, `is_sex` | isotype / TCR-lineage markers and sex genes are cell-state information even when few datasets vote |
+| drop | `is_pseudogene` | multi-mapping artefacts |
+| drop | `is_IG_V/D/J`, `is_TR_V/D/J` | clonotype identity, not cell state; vote only through B/T-cell-rich datasets |
+| drop | `miRNA snoRNA snRNA scaRNA misc_RNA rRNA Mt_tRNA Mt_rRNA ribozyme` | poly-A capture artefacts |
+| drop | `TEC` | unconfirmed loci |
+
+Not dropped on purpose: `is_mt` protein-coding genes, `is_ribo`, `is_hb`,
+olfactory / vomeronasal / taste receptors — they pass or fail on votes alone.
 
 Flags come from the Ensembl GTF reference (`featuresel.py ref`):
 `is_protein_coding`, `is_pseudogene`, `is_OR`, `is_vomeronasal`, `is_taste`,
 `is_IG_{V,D,J,C}`, `is_TR_{V,D,J,C}`, `is_mt`, `is_hb`, `is_ribo`, `is_sex`.
+Mouse ids that the rsi harmonization could only key by MGI accession (no Ensembl
+id) get their biotype from MGI's `MRK_List2.rpt` feature type, so every gene in
+the corpus has a category.
 
 ## Tuning the thresholds
 
