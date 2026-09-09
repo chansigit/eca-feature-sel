@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 # local config override (keep the tracked config.yaml as the template)
 config.local.yaml
+# graphify skill output (local knowledge graph, not source)
+graphify-out/

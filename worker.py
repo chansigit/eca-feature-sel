@@ -1,234 +1,292 @@
 #!/usr/bin/env python
-"""eca-feature-sel Stage-1 worker.
+"""Per-dataset measurement: one h5ad in, two parquets out.
 
-Computes per-gene detection stats from ONE h5ad's raw ``layers/counts`` via
-streaming h5py (CSR or CSC), WITHOUT densifying or building an AnnData. Emits,
-per harmonized gene (``var.gene_id_harmonized`` = Ensembl ENSG/ENSMUSG):
+Per harmonized gene (``var.gene_id_harmonized``), dataset-level (all kept cells):
 
-    n_cells, n_detected (cells with count>0), sum_counts
+    n_cells, n_detected, sum_counts, var, expected_var, score, rank, hvg_upstream
 
-Unmapped var rows (no shared cross-dataset key) are counted only in the meta.
+plus a ``.lineages.parquet`` with (lineage, lineage_cells, gene, score, rank) for
+the top `n_store` genes of every kept lineage. Selection itself (s_min, n_max,
+lineage size, how many lineages) happens at build time from these; nothing here
+decides what is an HVG.
 
-Run per Slurm array task:
+Nothing here builds an AnnData: `var`/`obs` are read as arrays and
+``layers/counts`` is scanned twice with h5py (see hvg.py). ``var.highly_variable``
+as the upstream pipeline left it is carried along for comparison.
+
     worker.py --manifest jobs/manifest.tsv --index $SLURM_ARRAY_TASK_ID
-or directly:
-    worker.py --h5ad X.h5ad --species human --sample-key ts-lung --out out.parquet
+    worker.py --sample-key K --species human --h5ad X.h5ad --out out.parquet
 """
 import argparse
 import json
 import os
+import time
 
 import h5py
 import numpy as np
 import pandas as pd
 
-CHUNK = 20_000_000  # nnz read block; caps memory on the largest (9.6 GB) files
-UNION_CHUNK = 5_000_000  # smaller block for duplicate-gene union detection
+import featuresel
+import hvg
+
+CHUNK = 20_000_000  # nnz per read block; caps memory on the largest files
+ROWS = 20_000       # row block for dense layers
 MISSING_IDS = {"", "nan", "na", "none", "null"}
+MISSING_LABELS = MISSING_IDS | {"unknown", "unassigned", "<NA>".lower()}
 
 
 def _decode(arr):
     return np.array([x.decode() if isinstance(x, bytes) else x for x in arr], dtype=object)
 
 
-def _attr(node, name, default=b""):
+def _attr(node, name, default=""):
     v = node.attrs.get(name, default)
     return v.decode() if isinstance(v, bytes) else v
 
 
-def _normalize_ids(raw):
-    hid = np.empty(len(raw), dtype=object)
-    hid[:] = None
-    mapped = np.zeros(len(raw), dtype=bool)
-    for i, x in enumerate(raw):
-        if x is None:
-            continue
-        s = str(x).strip()
-        if s.lower() in MISSING_IDS:
-            continue
-        hid[i] = s
-        mapped[i] = True
-    return hid, mapped
-
-
-def _csr_gene_stats(g, n_vars):
-    """CSR (cells x genes): detection & sum per gene via chunked bincount over nnz."""
-    indices, data = g["indices"], g["data"]
-    nnz = int(indices.shape[0])
-    n_det = np.zeros(n_vars, dtype=np.int64)
-    sum_c = np.zeros(n_vars, dtype=np.float64)
-    for s in range(0, nnz, CHUNK):
-        e = min(s + CHUNK, nnz)
-        idx = np.asarray(indices[s:e])
-        dat = np.asarray(data[s:e], dtype=np.float64)
-        n_det += np.bincount(idx, minlength=n_vars)[:n_vars].astype(np.int64)
-        sum_c += np.bincount(idx, weights=dat, minlength=n_vars)[:n_vars]
-    return n_det, sum_c
-
-
-def _csc_gene_stats(g, n_vars):
-    """CSC (cells x genes): genes are columns; detection = nnz per column =
-    diff(indptr) (no data read); sum via a cumulative-sum difference."""
-    indptr = np.asarray(g["indptr"][:])
-    if len(indptr) != n_vars + 1:
-        raise SystemExit(f"csc indptr len {len(indptr)} != n_vars+1 {n_vars + 1}")
-    n_det = np.diff(indptr).astype(np.int64)
-    data = np.asarray(g["data"][:], dtype=np.float64)
-    cs = np.empty(len(data) + 1, dtype=np.float64)
-    cs[0] = 0.0
-    np.cumsum(data, out=cs[1:])
-    sum_c = cs[indptr[1:]] - cs[indptr[:-1]]
-    return n_det, sum_c
-
-
-def harmonized_ids(f, n_vars):
-    node = f["var/gene_id_harmonized"]
-    if isinstance(node, h5py.Group):  # AnnData categorical: categories + codes
-        cats = _decode(node["categories"][:])
+def _column(f, name, n_vars):
+    """Read one var column, materializing an AnnData categorical if needed."""
+    node = f.get(f"var/{name}")
+    if node is None:
+        return None
+    if isinstance(node, h5py.Group):  # categories + codes
+        cats = node["categories"][:]
         codes = np.asarray(node["codes"][:])
-        raw = np.empty(n_vars, dtype=object)
-        raw[:] = None
-        coded = codes >= 0
-        raw[coded] = cats[codes[coded]]
-    else:  # plain string dataset fallback
-        raw = _decode(node[:])
-    return _normalize_ids(raw)
+        out = np.empty(n_vars, dtype=object)
+        out[:] = None
+        ok = codes >= 0
+        out[ok] = _decode(cats)[codes[ok]]
+        return out
+    arr = np.asarray(node[:])
+    return _decode(arr) if arr.dtype.kind in "SO" else arr  # h5py hands back bytes
 
 
-def _group_ids(hid, mapped):
-    ids = np.array(sorted(set(hid[mapped])), dtype=object)
-    var_to_group = np.full(len(hid), -1, dtype=np.int64)
-    if len(ids):
-        lookup = {gid: i for i, gid in enumerate(ids)}
-        for i in np.flatnonzero(mapped):
-            var_to_group[i] = lookup[hid[i]]
-    group_sizes = np.bincount(var_to_group[mapped], minlength=len(ids)) if len(ids) else np.array([], dtype=np.int64)
-    return ids, var_to_group, group_sizes
+def harmonized_map(f, n_vars):
+    """(keep mask over var rows, group code per kept row, unique gene ids)."""
+    raw = _column(f, "gene_id_harmonized", n_vars)
+    if raw is None:
+        raise SystemExit("var.gene_id_harmonized not found")
+    ids = np.array([None if x is None or (isinstance(x, float) and np.isnan(x))
+                    or str(x).strip().lower() in MISSING_IDS else str(x).strip()
+                    for x in raw], dtype=object)
+    keep = np.array([x is not None for x in ids])
+    if not keep.any():
+        raise SystemExit("no valid harmonized gene ids")
+    codes, uniq = pd.factorize(pd.Series(ids[keep]))
+    return keep, np.asarray(codes), np.asarray(uniq, dtype=object)
 
 
-def _row_blocks(indptr, max_nnz):
-    n_obs = len(indptr) - 1
-    start = 0
-    while start < n_obs:
-        limit = indptr[start] + max_nnz
-        end = int(np.searchsorted(indptr, limit, side="right") - 1)
-        end = max(start + 1, min(end, n_obs))
-        yield start, end
-        start = end
 
 
-def _csr_duplicate_detection(g, var_to_dup, n_dup):
-    """Exact detection for duplicated harmonized IDs: count unique cell/gene pairs."""
-    indptr = np.asarray(g["indptr"][:])
-    indices = g["indices"]
-    dup_det = np.zeros(n_dup, dtype=np.int64)
-    for r0, r1 in _row_blocks(indptr, UNION_CHUNK):
-        s, e = int(indptr[r0]), int(indptr[r1])
-        if e <= s:
+def lineage_codes(f, n_obs, rule, meta, dropped=None):
+    """cell -> kept-lineage code (-1 = none, -2 = dropped cell), plus kept lineage
+    names/sizes.
+
+    The obs key is the first of `lineage_obs_key` that exists. Lineages under
+    `min_lineage_cells` (counted after dropping cells) are not made groups; their
+    cells still count towards the dataset-level call.
+    """
+    keys = rule.get("lineage_obs_key") or []
+    keys = [keys] if isinstance(keys, str) else keys
+    cols = set(f["obs"].attrs.get("column-order", []).tolist()) if "obs" in f else set()
+    key = next((k for k in keys if k in cols), None)
+    meta["lineage_obs_key"] = key
+    dropped = np.zeros(n_obs, dtype=bool) if dropped is None else dropped
+    if key is None:
+        return np.where(dropped, -2, -1).astype(np.int64), [], np.array([], dtype=np.int64)
+    node = f[f"obs/{key}"]
+    if isinstance(node, h5py.Group):
+        cats = _decode(node["categories"][:])
+        raw = np.asarray(node["codes"][:])
+        labels = np.array([cats[c] if c >= 0 else None for c in raw], dtype=object)
+    else:
+        labels = _decode(np.asarray(node[:]))
+    ok = np.array([x is not None and str(x).strip().lower() not in MISSING_LABELS
+                   for x in labels]) & ~dropped
+    names, sizes, codes = [], [], np.where(dropped, -2, -1).astype(np.int64)
+    min_cells = int(rule.get("min_lineage_cells", 200))
+    for name in pd.unique(labels[ok]):
+        idx = np.flatnonzero(ok & (labels == name))
+        if len(idx) < min_cells:
             continue
-        idx = np.asarray(indices[s:e])
-        dup = var_to_dup[idx]
-        keep = dup >= 0
-        if not keep.any():
-            continue
-        rows = np.repeat(np.arange(r1 - r0, dtype=np.int64), np.diff(indptr[r0:r1 + 1]))[keep]
-        keys = rows * n_dup + dup[keep]
-        uniq = np.unique(keys)
-        dup_det += np.bincount(uniq % n_dup, minlength=n_dup).astype(np.int64)
-    return dup_det
+        codes[idx] = len(names)
+        names.append(str(name))
+        sizes.append(len(idx))
+    meta["lineages_total"] = int(len(pd.unique(labels[ok])))
+    meta["lineages_kept"] = len(names)
+    return codes, names, np.array(sizes, dtype=np.int64)
 
 
-def _csc_duplicate_detection(g, var_to_dup, n_dup):
-    indptr = np.asarray(g["indptr"][:])
-    indices = g["indices"]
-    cells_by_dup = [[] for _ in range(n_dup)]
-    for j in np.flatnonzero(var_to_dup >= 0):
-        s, e = int(indptr[j]), int(indptr[j + 1])
-        if e > s:
-            cells_by_dup[int(var_to_dup[j])].append(np.asarray(indices[s:e], dtype=np.int64))
-    dup_det = np.zeros(n_dup, dtype=np.int64)
-    for i, arrays in enumerate(cells_by_dup):
-        if not arrays:
-            continue
-        cells = arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
-        dup_det[i] = int(np.unique(cells).size)
-    return dup_det
 
 
-def compute(h5ad, species, key, out):
+def compute(cfg, h5ad, species, key, out):
+    rule = cfg["hvg"]
+    layer = rule.get("layer", "counts")
+    meta = {"sample_key": key, "species": species, "h5ad": h5ad,
+            "h5ad_mtime": os.path.getmtime(h5ad),
+            "hvg_signature": featuresel.hvg_signature(cfg)}
     with h5py.File(h5ad, "r") as f:
-        g = f["layers/counts"]
-        enc = _attr(g, "encoding-type")
-        n_obs, n_vars = (int(x) for x in g.attrs["shape"])  # cells, genes
-        if enc == "csr_matrix":
-            n_det, sum_c = _csr_gene_stats(g, n_vars)
-        elif enc == "csc_matrix":
-            n_det, sum_c = _csc_gene_stats(g, n_vars)
+        if f"layers/{layer}" not in f:
+            raise SystemExit(f"{key}: layers/{layer} not found")
+        g = f[f"layers/{layer}"]
+        enc = _attr(g, "encoding-type", "array")
+        shape = tuple(int(x) for x in (g.attrs["shape"] if "shape" in g.attrs else g.shape))
+        n_obs, n_vars = shape
+        keep, codes, ids = harmonized_map(f, n_vars)
+        meta.update(n_cells=n_obs, n_vars_original=n_vars, encoding=enc,
+                    n_unmapped_rows=int((~keep).sum()), n_genes_harmonized=len(ids),
+                    n_duplicate_harmonized_ids=int(keep.sum() - len(ids)))
+
+        # numerical guard, not QC: cells with (almost) no counts break both methods
+        src = hvg.Reader(g, enc, n_obs, n_vars, budget=float(rule.get("cache_bytes", 6e9)))
+        depth = hvg.cell_depth(src)
+        dropped = depth < float(rule.get("min_cell_counts", 10))
+        meta["n_cells_dropped"] = int(dropped.sum())
+        lin_codes, lin_names, lin_sizes = lineage_codes(f, n_obs, rule, meta, dropped)
+        sizes = np.concatenate([[int((~dropped).sum())], lin_sizes]).astype(np.int64)
+        notes = {}
+        method = rule.get("method", "vst")
+        n_store = int(rule.get("n_store", 5000))
+        t0 = time.perf_counter()
+        if rule.get("compute", True):
+            res, det_rows, sum_rows, mean_rows, var_rows, valid = hvg.call(
+                src, lin_codes, sizes, methods=(method,),
+                span=float(rule.get("span", 0.3)), theta=float(rule.get("theta", 100)),
+                min_gene_cells=int(rule.get("min_gene_cells", 3)), notes=notes)
+            score_rows = res[method]
+            trend_rows = res[f"{method}_trend"]
+            rank_rows = hvg.ranks(score_rows, valid)
         else:
-            raise SystemExit(f"{key}: layers/counts encoding={enc!r} (need csr/csc)")
-        hid, mapped = harmonized_ids(f, n_vars)
-        ids, var_to_group, group_sizes = _group_ids(hid, mapped)
-        group_idx = var_to_group[mapped]
-        sum_counts = np.bincount(group_idx, weights=sum_c[mapped], minlength=len(ids))
-        n_detected = np.bincount(group_idx, weights=n_det[mapped], minlength=len(ids)).astype(np.int64)
+            sum_rows, sq_rows, det_rows, _ = hvg.moments(src, lin_codes, len(sizes))
+            N = np.maximum(sizes, 1)[:, None].astype(float)
+            mean_rows = sum_rows / N
+            var_rows = (sq_rows - N * mean_rows ** 2) / np.maximum(N - 1, 1)
+            score_rows = trend_rows = np.full(mean_rows.shape, np.nan)
+            rank_rows = np.zeros(mean_rows.shape, dtype=np.int32)
+        meta["hvg_seconds"] = round(time.perf_counter() - t0, 2)
+        meta["fit_notes"] = {(["dataset"] + lin_names)[i]: v for i, v in notes.items()}
+        n_grp = len(sizes)
 
-        dup_groups = np.flatnonzero(group_sizes > 1)
-        if len(dup_groups):
-            dup_lookup = {gid: i for i, gid in enumerate(dup_groups)}
-            var_to_dup = np.full(n_vars, -1, dtype=np.int64)
-            for i in np.flatnonzero(mapped):
-                gid = int(var_to_group[i])
-                if gid in dup_lookup:
-                    var_to_dup[i] = dup_lookup[gid]
-            if enc == "csr_matrix":
-                dup_det = _csr_duplicate_detection(g, var_to_dup, len(dup_groups))
-            else:
-                dup_det = _csc_duplicate_detection(g, var_to_dup, len(dup_groups))
-            n_detected[dup_groups] = dup_det
+        # var rows -> harmonized genes. Sums add; detection is an upper bound for
+        # the few duplicated ids (ponytail: exact would need another pass); score
+        # takes the best row, rank the best (smallest nonzero) row.
+        n_det = np.minimum(np.bincount(codes, weights=det_rows[0][keep],
+                                       minlength=len(ids)).astype(np.int64), int(sizes[0]))
+        sums = np.bincount(codes, weights=sum_rows[0][keep], minlength=len(ids))
+        score = np.full((n_grp, len(ids)), np.nan)
+        rank = np.zeros((n_grp, len(ids)), dtype=np.int32)
+        var_g = np.zeros((n_grp, len(ids)))
+        trend_g = np.full((n_grp, len(ids)), np.nan)
+        for i in range(n_grp):
+            score[i] = _best(codes, score_rows[i][keep], len(ids), np.fmax, np.nan)
+            r = np.where(rank_rows[i][keep] > 0, rank_rows[i][keep], np.iinfo(np.int32).max)
+            r = _best(codes, r, len(ids), np.minimum, np.iinfo(np.int32).max)
+            rank[i] = np.where(r == np.iinfo(np.int32).max, 0, r)
+            var_g[i] = _best(codes, var_rows[i][keep], len(ids), np.fmax, 0.0)
+            trend_g[i] = _best(codes, trend_rows[i][keep], len(ids), np.fmax, np.nan)
 
-    if len(hid) != n_vars:
-        raise SystemExit(f"{key}: var length {len(hid)} != counts n_vars {n_vars}")
+        up = _column(f, "highly_variable", n_vars)
+        if up is None:
+            hvg_up = np.zeros(len(ids), dtype=bool)
+            meta["upstream_hvg"] = None
+        else:
+            hvg_up = np.zeros(len(ids), dtype=bool)
+            np.logical_or.at(hvg_up, codes, np.asarray(up, dtype=bool)[keep])
+            uns_hvg = f.get("uns/hvg")
+            flavor = uns_hvg["flavor"][()] if uns_hvg is not None and "flavor" in uns_hvg else ""
+            meta["upstream_hvg"] = {
+                "n": int(hvg_up.sum()),
+                "flavor": flavor.decode() if isinstance(flavor, bytes) else str(flavor),
+                "batch_aware": "highly_variable_nbatches" in f["var"]}
+        sym = _column(f, "gene_symbol_harmonized", n_vars)
+        symbol = (_best_str(codes, sym[keep], len(ids)) if sym is not None else ids)
 
-    agg = pd.DataFrame({"harmonized_id": ids, "n_detected": n_detected, "sum_counts": sum_counts})
-    agg.insert(0, "sample_key", key)
-    agg.insert(1, "species", species)
-    agg["n_cells"] = int(n_obs)
+    meta.update(method=method, n_store=n_store, groups=["dataset"] + lin_names,
+                group_sizes=[int(x) for x in sizes],
+                n_rankable=[int((rank[i] > 0).sum()) for i in range(n_grp)],
+                score_at_rank={str(k): [float(np.nanmax(np.where(rank[i] == k, score[i], np.nan)))
+                                        if (rank[i] == k).any() else None for i in range(n_grp)]
+                               for k in (100, 500, 1000, 2000, 3000)})
 
+    df = pd.DataFrame({"sample_key": key, "species": species, "harmonized_id": ids, "symbol": symbol,
+                       "n_cells": int(sizes[0]), "n_detected": n_det, "sum_counts": sums,
+                       "var": var_g[0], "expected_var": trend_g[0],
+                       "score": score[0], "rank": rank[0], "hvg_upstream": hvg_up})
     os.makedirs(os.path.dirname(out), exist_ok=True)
     tmp = out + ".tmp"
-    agg.to_parquet(tmp, index=False)
+    df.to_parquet(tmp, index=False)
     os.replace(tmp, out)  # atomic: a half-written parquet never looks "done"
-
-    meta = {
-        "sample_key": key, "species": species, "h5ad": h5ad,
-        "h5ad_mtime": os.path.getmtime(h5ad), "encoding": enc,
-        "n_cells": int(n_obs), "n_vars_original": int(n_vars),
-        "n_genes_harmonized": int(agg.shape[0]),
-        "n_unmapped_rows": int((~mapped).sum()),
-        "n_unmapped_detected_rows": int((n_det[~mapped] > 0).sum()),
-        "n_duplicate_harmonized_ids": int(len(dup_groups)),
-        "nnz": int(n_det.sum()),
-    }
+    # per-(lineage, gene) detail for the top n_store genes of each lineage, so the
+    # lineage-size / s_min / n_max thresholds can all move at build time
+    rows = []
+    for i, (name, size) in enumerate(zip(lin_names, lin_sizes), start=1):
+        sel = (rank[i] > 0) & (rank[i] <= n_store)
+        rows.append(pd.DataFrame({"sample_key": key, "lineage": name, "lineage_cells": int(size),
+                                  "harmonized_id": ids[sel], "score": score[i][sel], "rank": rank[i][sel]}))
+    detail = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(
+        columns=["sample_key", "lineage", "lineage_cells", "harmonized_id", "score", "rank"])
+    lin_out = os.path.splitext(out)[0] + ".lineages.parquet"
+    detail.to_parquet(lin_out + ".tmp", index=False)
+    os.replace(lin_out + ".tmp", lin_out)
     with open(os.path.splitext(out)[0] + ".meta.json", "w") as fh:
         json.dump(meta, fh, indent=2)
-    print(f"[{key}] {species} cells={n_obs} genes={agg.shape[0]} enc={enc} -> {out}", flush=True)
+    s15 = int(np.nansum(score[0] >= 1.5))
+    print(f"[{key}] {species} cells={sizes[0]}/{n_obs} genes={len(ids)} enc={enc} "
+          f"lineages={len(lin_names)}/{meta.get('lineages_total', 0)} "
+          f"score>=1.5: {s15} upstream={int(hvg_up.sum())} {meta['hvg_seconds']}s -> {out}", flush=True)
+
+
+def _best(codes, values, n, op, fill):
+    """Aggregate var-row values onto genes with a ufunc (fmax / minimum)."""
+    out = np.full(n, fill, dtype=float)
+    op.at(out, codes, np.asarray(values, dtype=float))
+    return out
+
+
+def _best_str(codes, values, n):
+    """First non-empty symbol per gene."""
+    out = np.array([""] * n, dtype=object)
+    for c, v in zip(codes, values):
+        if not out[c] and v is not None and str(v) not in ("", "nan"):
+            out[c] = str(v)
+    return out
+
+
+def _run(args):
+    cfg, line = args
+    key, species, h5ad, out = line.split("\t")
+    compute(cfg, h5ad, species, key, out)
+    return key
 
 
 def main():
-    ap = argparse.ArgumentParser(description="eca-feature-sel stage-1 worker")
+    ap = argparse.ArgumentParser(description="eca-feature-sel per-dataset worker")
+    ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                     "config.yaml"))
     ap.add_argument("--manifest")
-    ap.add_argument("--index", type=int, help="1-based line in manifest")
+    ap.add_argument("--index", type=int, help="1-based line in manifest; omit to run all lines")
+    ap.add_argument("--jobs", type=int, default=1, help="processes when running a whole manifest")
     ap.add_argument("--h5ad")
     ap.add_argument("--species")
     ap.add_argument("--sample-key")
     ap.add_argument("--out")
     a = ap.parse_args()
+    cfg = featuresel.load_config(a.config)
     if a.manifest:
         lines = [ln for ln in open(a.manifest).read().splitlines() if ln.strip()]
-        key, species, h5ad, out = lines[a.index - 1].split("\t")
+        lines = [lines[a.index - 1]] if a.index else lines
     else:
-        key, species, h5ad, out = a.sample_key, a.species, a.h5ad, a.out
-    compute(h5ad, species, key, out)
+        lines = ["\t".join([a.sample_key, a.species, a.h5ad, a.out])]
+    # biggest files first so the pool does not end on one 6 GB straggler
+    lines.sort(key=lambda ln: -os.path.getsize(ln.split("\t")[2]))
+    if a.jobs > 1 and len(lines) > 1:
+        import multiprocessing as mp
+        with mp.get_context("fork").Pool(a.jobs) as pool:
+            for _ in pool.imap_unordered(_run, [(cfg, ln) for ln in lines]):
+                pass
+    else:
+        for line in lines:
+            _run((cfg, line))
 
 
 if __name__ == "__main__":

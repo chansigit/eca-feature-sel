@@ -1,105 +1,119 @@
 # eca-feature-sel
 
-Data-driven gene-vocabulary selection for single-cell **foundation-model**
-training. Turns a large corpus of harmonized `h5ad` datasets into a fixed,
-cross-dataset gene vocabulary using detection, HVG, and cluster-marker evidence.
+Gene-vocabulary selection for single-cell **foundation-model** training:
+per-dataset HVGs, unioned across a corpus of harmonized `h5ad` files, then
+filtered by gene-category keep/drop lists.
 
-Built for HPC (Slurm): measurement fans out one small job per dataset and is
-**cached**, so periodic re-runs only recompute what changed.
+Built for HPC (Slurm): one small job per dataset, **cached**, so re-runs only
+recompute what changed.
 
 ## Design
 
-- **Two vocabularies, independent.** Human (Ensembl `ENSG`) and mouse (`ENSMUSG`)
-  are built separately in their own ID spaces — no ortholog mapping. Species is
-  read from each dataset's `curation_stats.json`.
-- **Data-first.** Detection from raw `layers/counts`, per-dataset HVGs, and
-  within-dataset cluster markers are used as inclusion evidence. `.var` biotype is
-  auxiliary and is applied only by the category rule.
-- **Measurement ≠ policy.** Stage 1 caches per-gene detection stats. Stage 2 caches
-  per-dataset HVG and cluster-DEG selections. Selection is instant and re-runnable:
-  it unions the cached evidence and applies a category rule.
+- **Two vocabularies, independent.** Human (`ENSG`) and mouse (`ENSMUSG`) are
+  built in their own ID spaces — no ortholog mapping. Species comes from the
+  input TSV.
+- **Inputs from eca-rsi.** `scan_rsi.py` turns finished rsi units into the input
+  TSV, reading species from the gene ids rather than the directory name.
+- **No AnnData load, one disk read.** The worker reads `var`/`obs` and streams
+  `layers/counts` with h5py; the first pass is cached in RAM (up to
+  `hvg.cache_bytes`) and replayed. Dense files are converted to stored entries on
+  read (they are ~97% zeros), so a 1.5 GB dense matrix costs 0.5 s.
+- **Numerical guards, not QC.** Cells under `min_cell_counts` total counts and,
+  per group, genes seen in fewer than `min_gene_cells` cells are excluded: those
+  identical (mean, var) points are what made loess singular.
+- **A dataset's HVG = global ∪ per-lineage.** `seurat_v3` (vst) is scored on the
+  whole dataset and again inside each coarse lineage (`zmip_ann_coarse`), because
+  the global call is dominated by the majority population. Implemented here
+  (`hvg.py`), not via scanpy: streaming passes, loess with a quadratic fallback.
+  Verified against scanpy (Jaccard > 0.95; Pearson residuals to 1e-13).
+- **Measure once, threshold later.** Measurement stores every gene's *score*
+  (standardized variance; 1 = as variable as a typical gene of that expression
+  level) and *rank* per group. A gene passes in a group when
+  `score >= s_min` and `rank <= n_max`; both are build-time knobs. No fixed
+  "top 2000": at rank 2000 the score is already ~1.1 on a 28k-cell dataset.
+- **One rule, per-category thresholds.** A gene is a candidate iff it is HVG in
+  enough datasets, where "enough" depends on its category (e.g. `protein_coding: 3`,
+  `lncRNA: 10`). `N` emerges from the thresholds; it is not preset.
+- **Categories after data.** `category_keep` force-includes (whitelist),
+  `category_drop` excludes (blacklist); keep wins over drop.
+- **Stats are descriptive.** Detection rate and mean counts are reported per
+  gene so you can see how strongly a selected gene is expressed — they do not
+  filter anything.
 
-### Inclusion rule
-A harmonized gene is a **candidate** if any inclusion rule holds:
-- **detection** — detected in at least `min_frac` cells in at least
-  `min_dataset_occurrence` datasets (default `min_frac=0.01`,
-  `min_dataset_occurrence=10`);
-- **HVG** — selected as a highly variable gene within at least `min_datasets`
-  datasets (default top 3,000 HVGs per dataset);
-- **cluster-DEG** — selected as a one-vs-rest marker for at least one eligible
-  cell-type or cluster group.
-
-`N` emerges from the thresholds; it is not preset.
-
-### Category rule
-Every gene is annotated (biotype + family flags: OR, IG/TR V·D·J·C, taste,
-vomeronasal, mt, hb, ribo, sex) and each snapshot reports what each scenario costs:
-- **default** — drop pseudogenes after count-driven candidate selection.
-- **narrow** — drop OR / vomeronasal / taste / IG-V·D·J / TR-V·D·J; **keep** IG-C/TR-C
-  constant regions. Robust lncRNA (MALAT1/NEAT1/XIST) survive on data alone.
-- **wide** — narrow + drop all non-`protein_coding` (also drops MALAT1/NEAT1/XIST).
-
-Set categories with `--category-rule`; `--veto` is kept as a hidden compatibility alias. The
-`category_excluded`, `selected_by_detection`, `selected_by_hvg`,
-`selected_by_cluster_deg`, `veto_narrow`, and `veto_wide` columns are written so
-you can also filter the TSV directly.
+See `docs/selection_design.md` for the rules, flags and stat columns.
 
 ## Usage
 
 ```bash
-PY=/path/to/venv/bin/python          # needs h5py numpy pandas pyarrow yaml scanpy scipy
+PY=/path/to/venv/bin/python          # needs anndata scanpy scikit-misc numpy pandas pyarrow scipy yaml
 # edit config.yaml: inputs_tsv, cache_root (MUST be on $SCRATCH), venv_python
 
+$PY scan_rsi.py                      # rsi results -> mouse.tsv (--species human, --list)
 $PY featuresel.py status             # what's done / stale / missing
 $PY featuresel.py ref                # one-time: Ensembl biotype reference (needs internet)
-$PY featuresel.py measure            # submit Stage-1 + Stage-2 measurement jobs
-$PY featuresel.py measure-stage2 --batch-size 4 --batch-max-cells 50000  # override chunking
-$PY featuresel.py measure-stage2-local --limit 4    # local smoke/profiling run, one Python process
-$PY featuresel.py build              # union detection/HVG/cluster-DEG -> snapshot
+$PY featuresel.py measure --local    # all CPUs of this node; 160 mouse datasets in ~3 min
+$PY featuresel.py measure            # or one Slurm array task per dataset
+$PY featuresel.py build              # union HVGs + category rules -> snapshot
 $PY featuresel.py refresh            # measure -> wait -> build
 
-# decide the gene range:
-$PY featuresel.py build --min-dataset-occurrence 8 --tag loose
-$PY featuresel.py build --category-rule is_pseudogene,is_OR,is_IG_V,is_IG_D,is_IG_J,is_TR_V,is_TR_D,is_TR_J,is_vomeronasal,is_taste --tag narrow
-$PY featuresel.py list                            # all snapshots
-$PY featuresel.py diff latest narrow              # genes added / removed between snapshots
+# retune per category (build is instant; measurement is untouched):
+$PY featuresel.py build --hvg-min-datasets lncRNA=15,miRNA=5 --tag t2
+$PY featuresel.py build --hvg-min-datasets 3 --tag flat3          # bare int = flat
+$PY featuresel.py build --category-drop is_pseudogene,is_OR,is_vomeronasal,is_taste --tag narrow
+$PY featuresel.py build --category-keep is_protein_coding --tag allpc  # unconditional
+$PY featuresel.py build --s-min 1.2 --n-max 2000 --tag loose   # per-group pass rule
+$PY featuresel.py build --hvg-source global --tag noline       # drop the lineage half
+$PY featuresel.py build --min-lineage-cells 500 --min-lineages 2 --tag strictlin
+
+$PY report.py --all                  # per-dataset HTML report + genes.tsv + index.html
+$PY explore.py mca3.0-brain-mouse    # interactive explorer (sliders, vst vs pearson)
+$PY votes.py                         # corpus vote explorer: genes passing per category,
+                                     # s_min and vote cutoff as sliders -> cache/figs/votes_{sp}.html
 ```
 
-Each `build` writes `cache/vocab/<tag>/vocab_{human,mouse}.tsv` (key column =
-`harmonized_id`, the FM token id) + `params.json`, and updates `cache/vocab/latest`.
+Each `build` writes `cache/vocab/<tag>/`: `vocab_{sp}.tsv` (key column =
+`harmonized_id`, the FM token id), two tuning tables — `thresholds_{sp}.tsv`
+(genes per biotype at each dataset-count threshold) and `sweep_smin_{sp}.tsv`
+(the whole selection re-run at s_min 1.1…2.0: votes per dataset and final size)
+— and `params.json`; and updates `cache/vocab/latest`.
 
 ## Layout
 
 ```
-featuresel.py   CLI (status/measure/measure-stage1/measure-stage2/ref/build/refresh/diff/list)
-worker.py       per-dataset Stage-1 detection stats, run by each array task
-worker_stage2.py per-dataset Stage-2 HVG + cluster-DEG selections
-config.yaml     paths + slurm resources + default policy
-human.tsv       explicit human input dataset list: sample_key, species, h5ad
-mouse.tsv       explicit mouse input dataset list: sample_key, species, h5ad
-# cache_root (on $SCRATCH, git-ignored): stage1/  stage2/  ref/  master/  vocab/<tag>/  jobs/
+featuresel.py   CLI (status / measure / ref / build / refresh)
+worker.py       per-dataset scores + expression stats (one process per dataset)
+hvg.py          streaming vst / pearson scoring, dataset-level + per lineage
+report.py       per-dataset HTML report from the cached measurement
+explore.py      interactive single-dataset explorer (plotly, self-contained)
+scan_rsi.py     eca-rsi results -> inputs TSV
+test_worker.py  self-check: python test_worker.py
+config.yaml     paths + slurm resources + hvg/selection defaults
+human.tsv       human inputs: sample_key, species, h5ad (tab-separated)
+mouse.tsv       mouse inputs
+# cache_root (on $SCRATCH, git-ignored): stats/  ref/  vocab/<tag>/  jobs/
 ```
 
 ## Notes
-- Inputs are explicit when `inputs_tsv` is set. It can be one TSV path or a YAML list
-  of TSV paths, for example `human.tsv` and `mouse.tsv`. Each TSV must have three
-  tab-separated columns: `sample_key`, `species`, and `h5ad`. Lines beginning with `#`
-  are ignored; a header row is allowed. Relative h5ad paths are resolved relative to
-  the TSV file.
-- If `inputs_tsv` is unset, corpus discovery falls back to scanning immediate dataset
-  directories under `corpus_root` for usable `.h5ad` files. This fallback does not
-  assume an h5ad filename suffix; files are chosen by content.
-- Reuse is mtime-based: a dataset is recomputed only if its selected `h5ad` is newer
-  than its cached stat (or missing). Removing a dataset from the corpus drops it from
-  the next build automatically.
-- Stage-1 jobs are tiny (streaming bincount, <1 GB peak). Stage-2 jobs load one
-  dataset at a time with Scanpy and use the separate `slurm_stage2` resources.
-- `measure-stage2` can pack multiple small datasets into one Slurm array task via
-  `slurm_stage2.batch_size` and `slurm_stage2.batch_max_cells`. This reduces repeated
-  Python/Scanpy startup cost while keeping large datasets isolated.
-- Stage-2 meta JSON files include `phase_times_sec` so lazy import, read, HVG,
-  and cluster-DEG bottlenecks can be profiled after a run. `measure-stage2-local`
-  processes multiple datasets in one Python process to avoid repeated Scanpy
-  import overhead during local smoke tests.
-- Not a coverage fix: mouse lncRNA are limited upstream (Tabula Muris quantified a
-  ~23k-gene, protein-coding-focused reference), not by cell count.
+- Each input TSV has three tab-separated columns: `sample_key`, `species`,
+  `h5ad`. `#` comments and a header row are allowed; relative h5ad paths resolve
+  against the TSV.
+- Each dataset writes two parquets: per-gene stats with the dataset-level
+  `score`/`rank`, and a `.lineages.parquet` with (lineage, lineage_cells, gene,
+  score, rank) for the top `hvg.n_store` genes of each lineage. So `--s-min`,
+  `--n-max`, `--min-lineage-cells`, `--min-lineages` are all **build-time** —
+  retune without remeasuring. `hvg.min_lineage_cells` is only the measurement
+  floor and `n_store` the ceiling on `n_max`.
+- `hvg.method: pearson` (analytic Pearson residuals) is implemented and verified
+  but O(cells × genes) dense — ~50× slower than vst. Kept for comparison in
+  `explore.py`.
+- The file's own `var.highly_variable` is carried along as `hvg_upstream`
+  (`--hvg-source upstream`) for comparison. Set `hvg.compute: false` to read only
+  that and skip our passes.
+- Each h5ad needs `layers/counts` and `var.gene_id_harmonized`. Var rows with no
+  harmonized id are dropped; duplicate ids are summed into one column before
+  stats and HVG.
+- Reuse is mtime-based plus a hash of the `hvg:` config block: a dataset is
+  recomputed only if its h5ad is newer or the HVG settings changed. Dropping a
+  dataset from the TSV drops it from the next build.
+- Jobs are small and I/O bound (the streaming pass never holds the matrix);
+  `slurm.mem` only needs headroom for `hvg.compute: true`.

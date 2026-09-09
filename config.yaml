@@ -2,57 +2,62 @@
 # Paths are cluster-specific; edit for your environment. cache_root MUST be on
 # $SCRATCH (never $HOME) per Sherlock policy.
 
-corpus_root: /scratch/users/chensj16/sc-curation-output     # fallback auto-discovery root
-inputs_tsv:                                                 # explicit sample_key/species/h5ad lists
-  - human.tsv
+inputs_tsv:                                                  # sample_key/species/h5ad lists
   - mouse.tsv
+  # - human.tsv   # old sc-curation corpus: no var.highly_variable, needs hvg.compute: true
 cache_root:  /scratch/users/chensj16/eca-feature-sel/cache   # all computed results (reused)
 venv_python: /scratch/users/chensj16/venvs/dl2025/.venv/bin/python
-ensembl_release: "112"                                        # for the biotype reference
+ensembl_release: "112"                                       # for the biotype reference
 
 slurm:
   partition: normal
-  time: "00:20:00"
-  mem: 4GB
-  cpus: 1
-  array_throttle: 100        # max concurrent array tasks (be nice to the scheduler)
-
-slurm_stage2:
-  partition: normal
-  time: "04:00:00"
+  time: "02:00:00"
   mem: 32GB
   cpus: 4
-  array_throttle: 20
-  batch_size: 4              # run up to this many small datasets per array task
-  batch_max_cells: 50000     # keep larger stage-2 datasets isolated; 0 disables
+  array_throttle: 40         # max concurrent array tasks (be nice to the scheduler)
 
-# Default selection policy. Everything here is overridable on the `build` CLI.
-# The category rule removes selected categories after data-driven candidate selection.
+# Measured per dataset (changing this invalidates the cache).
+# A dataset's HVG set = the dataset-level call UNION the per-lineage calls.
+# var.highly_variable as the upstream rsi pipeline left it is recorded alongside.
+hvg:
+  layer: counts
+  compute: true            # false = only read upstream var.highly_variable
+  method: vst              # vst (seurat_v3 loess) | pearson (analytic Pearson residuals, ~50x slower)
+  n_store: 5000            # per lineage, keep the top-n_store genes' score/rank (= max n_max)
+  span: 0.3                # vst: loess span; quadratic fit is the fallback
+  theta: 100               # pearson: NB overdispersion (Lause 2021 default)
+  # numerical guards, not QC (rsi already did QC): keep these loose
+  min_cell_counts: 10      # drop cells with fewer total counts (mu ~ 0 breaks pearson)
+  min_gene_cells: 3        # a gene seen in fewer cells of a group is not ranked there
+  min_lineage_cells: 200   # measurement floor; raise it again at build time
+  lineage_obs_key:         # first one present in obs wins
+    - zmip_ann_coarse
+    - msp_ann_coarse
+    - cell_lineage
+
+# Applied at build time; all overridable on the `build` CLI. Nothing here changes
+# the measurement, so retuning is instant: edit and re-run `build --tag ...`.
 selection:
-  detection_rule:
-    min_frac: 0.01           # gene must be detected in at least this fraction of cells
-    min_dataset_occurrence: 10  # min datasets where the gene clears min_frac
+  # Which per-dataset HVG call lets a dataset vote for a gene:
+  #   union    dataset-level call OR its lineage calls   (the intended default)
+  #   global   dataset-level call only
+  #   lineage  lineage calls only
+  #   upstream var.highly_variable as the rsi pipeline left it (seurat, 2000, batched)
+  hvg_source: union
+  # A gene passes in a group when score >= s_min (standardized variance: 1 = as
+  # variable as a typical gene of that expression level) and rank <= n_max (cap).
+  s_min: 1.5
+  n_max: 3000
+  min_lineage_cells: 200     # ignore smaller lineages (>= hvg.min_lineage_cells)
+  min_lineages: 1            # gene must pass in this many lineages to vote that way
 
-  hvg_rule:
-    n_top_genes: 3000        # selected independently within each dataset
-    min_datasets: 1          # min datasets where the gene is selected as HVG
-    layer: counts
-    flavor: seurat_v3
-    normalize_target_sum: 10000
+  # HVG support a gene needs, per category. Keys are is_* flags or exact Ensembl
+  # biotypes; FIRST match wins (so put narrow categories first), `default` is the
+  # fallback. See cache/vocab/<tag>/thresholds_{sp}.tsv for the tuning table.
+  hvg_min_datasets:
+    protein_coding: 3
+    lncRNA: 10
+    default: 10
 
-  cluster_deg_rule:
-    obs_key_priority: [cell_type_fine, cell_type_coarse, cell_type, cell_subtype, cluster_annotation, cluster, clusters]
-    missing_obs_policy: skip_dataset
-    method: wilcoxon
-    one_vs_rest: true
-    min_cluster_cells: 50
-    min_other_cells: 50
-    min_pct_in_cluster: 0.10
-    min_pct_difference: 0.05
-    min_log2fc: 0.25
-    max_adj_pvalue: 0.05
-    top_n_per_cluster: 100
-    candidate_multiplier: 20
-    min_datasets: 1
-
-  category_rule: [is_pseudogene]
+  category_keep: []          # whitelist: force-include, e.g. [is_mt]
+  category_drop: [is_pseudogene]   # blacklist: exclude; keep wins over drop

@@ -1,25 +1,16 @@
 #!/usr/bin/env python
-"""eca-feature-sel: counts-driven gene-vocabulary selection for single-cell FMs.
+"""eca-feature-sel: HVG-union gene vocabulary for single-cell FMs.
 
-Measurement (Stage 1/2, Slurm-parallel, cached) is separated from policy
-(Stage 3, instant, re-runnable). Human and mouse are built independently in
-their own Ensembl ID spaces. Category rules are applied only after data-driven
-candidate selection.
+Per dataset: top-N HVGs + basic expression stats (Slurm-parallel, cached).
+Across datasets: union the HVGs, then apply gene-category keep/drop lists.
+Human and mouse are built independently in their own Ensembl ID spaces.
 
 Subcommands:
-  status               scan corpus vs cache; report done / stale / missing
-  measure [--force]    submit Stage-1 and Stage-2 measurement jobs
-  measure-stage1       submit Stage-1 detection measurement jobs
-  measure-stage2       submit Stage-2 HVG/cluster-DEG measurement jobs
-  measure-stage2-local run Stage-2 jobs locally in one Python process
-  ref [--force]        build the Ensembl biotype reference (needs internet)
-  build [opts] [--tag] aggregate cached stats + select -> a versioned vocab snapshot
-  refresh [opts]       measure -> wait -> build
-  diff A B             compare two vocab snapshots (genes added / removed)
-  list                 list vocab snapshots
-
-Staleness is tracked per stage from cache files and input h5ad mtimes, so
-re-running only recomputes changed/new datasets; everything else is reused.
+  status              inputs vs cache: done / stale / missing
+  measure [--force]   submit one array task per dataset (--local runs here)
+  ref [--force]       build the Ensembl biotype/flag reference (needs internet)
+  build [opts]        union cached HVGs + category rules -> vocab snapshot
+  refresh             measure -> wait -> build
 """
 import argparse
 import gzip
@@ -32,7 +23,6 @@ import subprocess
 import time
 import urllib.request
 
-import h5py
 import numpy as np
 import pandas as pd
 import yaml
@@ -40,258 +30,120 @@ import yaml
 pd.set_option("future.no_silent_downcasting", True)  # quiet fillna(False) on flag cols
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DET_THRESH = [0.005, 0.01, 0.02, 0.05]
-NARROW = ["is_OR", "is_vomeronasal", "is_taste",
-          "is_IG_V", "is_IG_D", "is_IG_J", "is_TR_V", "is_TR_D", "is_TR_J"]
-FLAGCOLS = NARROW + ["is_pseudogene", "is_IG_C", "is_TR_C", "is_mt", "is_hb", "is_ribo", "is_sex"]
 SPECIES = ("human", "mouse")
-STAGE2_ALGORITHM_VERSION = 2
+HVG_SOURCES = ["union", "global", "lineage", "upstream"]
+FLAGCOLS = ["is_protein_coding", "is_pseudogene", "is_OR", "is_vomeronasal", "is_taste",
+            "is_IG_V", "is_IG_D", "is_IG_J", "is_IG_C", "is_TR_V", "is_TR_D", "is_TR_J",
+            "is_TR_C", "is_mt", "is_hb", "is_ribo", "is_sex"]
 
 
-# ---------------------------------------------------------------- config / paths
+# ---------------------------------------------------------------- config / inputs
 def load_config(path):
     with open(path) as fh:
         cfg = yaml.safe_load(fh)
-    cfg["_config_path"] = path
+    cfg["_config_path"] = os.path.abspath(path)
     c = cfg["cache_root"]
-    cfg["_dirs"] = {d: os.path.join(c, d) for d in
-                    ("stage1", "stage2", "ref", "master", "vocab", "jobs")}
+    cfg["_dirs"] = {d: os.path.join(c, d) for d in ("stats", "ref", "vocab", "jobs")}
     cfg["_dirs"]["logs"] = os.path.join(c, "jobs", "logs")
     for d in cfg["_dirs"].values():
         os.makedirs(d, exist_ok=True)
     return cfg
 
 
-def _read_stats(dsdir):
-    js = os.path.join(dsdir, "curation_stats.json")
-    if not os.path.exists(js):
-        return {}
-    try:
-        with open(js) as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
+def hvg_signature(cfg):
+    """Cached per-dataset results are stale when the HVG settings change."""
+    txt = json.dumps(cfg["hvg"], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(txt.encode()).hexdigest()
 
 
-def species_of(dsdir, stats=None):
-    """Prefer curation_stats.json species; fall back to the dir-name prefix."""
-    sp = (stats or _read_stats(dsdir)).get("species")
-    if sp in SPECIES:
-        return sp
-    b = os.path.basename(dsdir)
-    if b.startswith(("ts-", "3ca-")):
-        return "human"
-    if b.startswith(("tm-", "tms-")):
-        return "mouse"
-    return None
-
-
-def _decode_attr_list(v):
-    return [x.decode() if isinstance(x, bytes) else str(x) for x in v]
-
-
-def _h5ad_info(path):
-    """Return minimal content metadata for h5ad selection, without loading AnnData."""
-    try:
-        with h5py.File(path, "r") as f:
-            if "layers/counts" not in f or "var/gene_id_harmonized" not in f:
-                return None
-            shape = f["layers/counts"].attrs.get("shape")
-            if shape is None or len(shape) != 2:
-                return None
-            obs_cols = set(_decode_attr_list(f["obs"].attrs.get("column-order", []))) if "obs" in f else set()
-            post_filter_cols = {"doublet_score", "predicted_doublet", "mrvi_leiden", "harmony_leiden"}
-            return {
-                "path": path,
-                "n_obs": int(shape[0]),
-                "n_vars": int(shape[1]),
-                "has_post_filter_cols": bool(obs_cols & post_filter_cols),
-            }
-    except Exception:
-        return None
-
-
-def choose_h5ad(dsdir, stats):
-    """Choose the dataset h5ad by content, not by filename convention.
-
-    Prefer files that are usable by worker.py and whose shape matches
-    curation_stats.json. If multiple files remain equivalent, use content-derived
-    post-filter columns as a tie-breaker, then fall back to mtime/path for a
-    deterministic choice.
-    """
-    candidates = []
-    for name in sorted(os.listdir(dsdir)):
-        path = os.path.join(dsdir, name)
-        if not os.path.isfile(path) or not name.lower().endswith(".h5ad"):
-            continue
-        info = _h5ad_info(path)
-        if info is None:
-            continue
-        score = 0
-        if stats.get("cells_kept") is not None and info["n_obs"] == int(stats["cells_kept"]):
-            score += 4
-        if stats.get("genes") is not None and info["n_vars"] == int(stats["genes"]):
-            score += 2
-        if info["has_post_filter_cols"]:
-            score += 1
-        candidates.append((score, os.path.getmtime(path), path))
-    if not candidates:
-        return None
-    return max(candidates)[2]
-
-
-def _resolve_path(path, base):
+def _resolve(path, base):
     path = os.path.expanduser(str(path))
     return path if os.path.isabs(path) else os.path.abspath(os.path.join(base, path))
 
 
-def _stage1_record(cfg, key, sp, h5ad):
-    if sp not in SPECIES:
-        raise SystemExit(f"{key}: species={sp!r} (expected one of {SPECIES})")
-    if not os.path.exists(h5ad):
-        raise SystemExit(f"{key}: h5ad not found: {h5ad}")
-    par = os.path.join(cfg["_dirs"]["stage1"], key + ".parquet")
-    stale = (not os.path.exists(par)) or (os.path.getmtime(h5ad) > os.path.getmtime(par))
-    return {"key": key, "species": sp, "h5ad": h5ad, "out": par, "stale": stale}
-
-
-def selection_cfg(cfg):
-    """Return the current selection config.
-
-    ``select_v2`` is accepted only as a backward-compatible config key for older
-    scratch smoke configs.
-    """
-    d = cfg.get("selection", cfg.get("select_v2"))
-    if d is None:
-        raise SystemExit("config is missing selection settings")
-    return d
-
-
-def stage2_measure_signature(cfg):
-    d = selection_cfg(cfg)
-    payload = {
-        "stage2_algorithm_version": STAGE2_ALGORITHM_VERSION,
-        "hvg_rule": d.get("hvg_rule", {}),
-        "cluster_deg_rule": d.get("cluster_deg_rule", {}),
-    }
-    txt = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(txt.encode()).hexdigest()
-
-
-def _stage2_record(cfg, rec):
-    out = os.path.join(cfg["_dirs"]["stage2"], rec["key"] + ".parquet")
-    meta = os.path.splitext(out)[0] + ".meta.json"
-    sig = stage2_measure_signature(cfg)
-    stale = (not os.path.exists(out)) or (os.path.getmtime(rec["h5ad"]) > os.path.getmtime(out))
-    if os.path.exists(meta):
-        try:
-            m = json.load(open(meta))
-            old_sig = m.get("stage2_measure_signature", m.get("selection_v2_measure_signature"))
-            stale = stale or old_sig != sig
-        except Exception:
-            stale = True
-    else:
-        stale = True
-    r = dict(rec)
-    r["stage2_out"] = out
-    r["stage2_stale"] = stale
-    return r
-
-
-def scan_input_list(cfg):
-    paths = cfg.get("inputs_tsv")
-    if not paths:
-        return None
+def scan_inputs(cfg):
+    """One record per dataset from inputs_tsv (sample_key, species, h5ad)."""
+    paths = cfg["inputs_tsv"]
     if isinstance(paths, str):
         paths = [paths]
+    sig = hvg_signature(cfg)
     out, seen = [], set()
-    config_dir = os.path.dirname(os.path.abspath(cfg["_config_path"]))
-    for raw_path in paths:
-        path = _resolve_path(raw_path, config_dir)
+    for raw in paths:
+        path = _resolve(raw, os.path.dirname(cfg["_config_path"]))
         if not os.path.exists(path):
             raise SystemExit(f"inputs_tsv not found: {path}")
-        with open(path) as fh:
-            for n, line in enumerate(fh, 1):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.split("\t")
-                if fields[0] == "sample_key":
-                    continue
-                if len(fields) != 3:
-                    raise SystemExit(f"{path}:{n}: expected 3 tab-separated fields: sample_key species h5ad")
-                key, sp, h5ad = fields
-                if key in seen:
-                    raise SystemExit(f"{path}:{n}: duplicate sample_key {key!r}")
-                seen.add(key)
-                out.append(_stage1_record(cfg, key, sp, _resolve_path(h5ad, os.path.dirname(path))))
+        for n, line in enumerate(open(path), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if fields[0] == "sample_key":
+                continue
+            if len(fields) != 3:
+                raise SystemExit(f"{path}:{n}: expected 3 tab-separated fields")
+            key, sp, h5ad = fields
+            if sp not in SPECIES:
+                raise SystemExit(f"{path}:{n}: species={sp!r} (expected one of {SPECIES})")
+            if key in seen:
+                raise SystemExit(f"{path}:{n}: duplicate sample_key {key!r}")
+            seen.add(key)
+            h5ad = _resolve(h5ad, os.path.dirname(path))
+            if not os.path.exists(h5ad):
+                raise SystemExit(f"{path}:{n}: h5ad not found: {h5ad}")
+            out.append({"key": key, "species": sp, "h5ad": h5ad,
+                        "out": os.path.join(cfg["_dirs"]["stats"], key + ".parquet")})
+    for r in out:
+        r["stale"] = _is_stale(r, sig)
     return out
 
 
-def scan_corpus(cfg):
-    """One record per dataset with a usable h5ad, selected by content and flagged
-    stale if its stage-1 output is missing or older than the h5ad."""
-    listed = scan_input_list(cfg)
-    if listed is not None:
-        return listed
-    out = []
-    for key in sorted(os.listdir(cfg["corpus_root"])):
-        dsdir = os.path.join(cfg["corpus_root"], key)
-        if not os.path.isdir(dsdir):
-            continue
-        stats = _read_stats(dsdir)
-        sp = species_of(dsdir, stats)
-        if sp is None:
-            continue
-        f = choose_h5ad(dsdir, stats)
-        if f is None:
-            continue
-        out.append(_stage1_record(cfg, key, sp, f))
-    return out
+def _is_stale(rec, sig):
+    if not os.path.exists(rec["out"]):
+        return True
+    if os.path.getmtime(rec["h5ad"]) > os.path.getmtime(rec["out"]):
+        return True
+    meta = os.path.splitext(rec["out"])[0] + ".meta.json"
+    try:
+        return json.load(open(meta)).get("hvg_signature") != sig
+    except Exception:
+        return True
 
 
-# ---------------------------------------------------------------------- status
+# ---------------------------------------------------------------- status/measure
 def cmd_status(cfg, args):
-    ds = scan_corpus(cfg)
-    print(f"corpus_root: {cfg['corpus_root']}")
-    print(f"cache_root:  {cfg['cache_root']}")
+    ds = scan_inputs(cfg)
+    print(f"cache_root: {cfg['cache_root']}")
     for sp in SPECIES:
         s = [d for d in ds if d["species"] == sp]
         stale = [d for d in s if d["stale"]]
-        print(f"  {sp:6}: {len(s):3} datasets  |  up-to-date {len(s)-len(stale):3}  |  "
+        print(f"  {sp:6}: {len(s):3} datasets | up-to-date {len(s) - len(stale):3} | "
               f"stale/missing {len(stale):3}")
-    ds2 = [_stage2_record(cfg, d) for d in ds]
+    print(f"  TOTAL: {len(ds)} datasets, {sum(d['stale'] for d in ds)} need (re)compute")
     for sp in SPECIES:
-        s = [d for d in ds2 if d["species"] == sp]
-        stale = [d for d in s if d["stage2_stale"]]
-        print(f"  {sp:6} stage2: {len(s):3} datasets  |  up-to-date {len(s)-len(stale):3}  |  "
-              f"stale/missing {len(stale):3}")
-    tot_stale = [d for d in ds if d["stale"]]
-    tot_stage2_stale = [d for d in ds2 if d["stage2_stale"]]
-    print(f"  TOTAL stage1: {len(ds)} datasets, {len(tot_stale)} need (re)compute")
-    print(f"  TOTAL stage2: {len(ds2)} datasets, {len(tot_stage2_stale)} need (re)compute")
-    for sp in SPECIES:
-        gs = os.path.join(cfg["_dirs"]["master"], f"gene_summary_{sp}.parquet")
-        if os.path.exists(gs):
-            print(f"  master[{sp}] built: {os.path.getmtime(gs):.0f} "
-                  f"({pd.read_parquet(gs).shape[0]} genes)")
-    lat = os.path.join(cfg["_dirs"]["vocab"], "latest")
-    if os.path.islink(lat) or os.path.exists(lat):
-        print(f"  latest vocab -> {os.path.realpath(lat)}")
+        v = os.path.join(cfg["_dirs"]["vocab"], "latest", f"vocab_{sp}.tsv")
+        if os.path.exists(v):
+            print(f"  latest vocab[{sp}]: {sum(1 for _ in open(v)) - 1} rows")
 
 
-# --------------------------------------------------------------------- measure
-def cmd_measure_stage1(cfg, args):
-    ds = scan_corpus(cfg)
+def cmd_measure(cfg, args):
+    ds = scan_inputs(cfg)
     todo = ds if args.force else [d for d in ds if d["stale"]]
     if not todo:
-        print("nothing to measure-stage1 (all up-to-date). use --force to recompute.")
+        print("nothing to measure (all up-to-date). use --force to recompute.")
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
     man = os.path.join(cfg["_dirs"]["jobs"], f"manifest_{stamp}.tsv")
     with open(man, "w") as fh:
         for d in todo:
             fh.write(f"{d['key']}\t{d['species']}\t{d['h5ad']}\t{d['out']}\n")
+
+    q = shlex.quote
+    worker = f"{q(cfg['venv_python'])} {q(os.path.join(HERE, 'worker.py'))} --config {q(cfg['_config_path'])}"
+    if args.local:
+        jobs = args.jobs or max(1, len(os.sched_getaffinity(0)))
+        print(f"running {len(todo)} dataset(s) locally with {jobs} process(es)", flush=True)
+        subprocess.run(f"{worker} --manifest {q(man)} --jobs {jobs}", shell=True, check=True)
+        return None
     sl = cfg["slurm"]
     sb = os.path.join(cfg["_dirs"]["jobs"], f"measure_{stamp}.sbatch")
     with open(sb, "w") as fh:
@@ -304,162 +156,13 @@ def cmd_measure_stage1(cfg, args):
 #SBATCH --array=1-{len(todo)}%{sl['array_throttle']}
 #SBATCH --output={cfg['_dirs']['logs']}/%A_%a.out
 set -euo pipefail
-{cfg['venv_python']} {HERE}/worker.py --manifest {man} --index $SLURM_ARRAY_TASK_ID
+export OMP_NUM_THREADS={sl['cpus']} OPENBLAS_NUM_THREADS={sl['cpus']} MKL_NUM_THREADS={sl['cpus']}
+{worker} --manifest {q(man)} --index $SLURM_ARRAY_TASK_ID
 """)
     res = subprocess.run(["sbatch", sb], capture_output=True, text=True)
     print(res.stdout.strip() or res.stderr.strip())
-    jid = res.stdout.strip().split()[-1] if res.returncode == 0 else None
-    print(f"submitted stage1 array of {len(todo)} task(s) [{cfg['slurm']['array_throttle']} concurrent]")
-    return jid
-
-
-def cmd_measure_stage2(cfg, args):
-    ds = [_stage2_record(cfg, d) for d in scan_corpus(cfg)]
-    todo = ds if args.force else [d for d in ds if d["stage2_stale"]]
-    if not todo:
-        print("nothing to measure-stage2 (all up-to-date). use --force to recompute.")
-        return None
-    sl = cfg.get("slurm_stage2", cfg.get("slurm_v2", cfg["slurm"]))
-    batch_size = getattr(args, "batch_size", None)
-    if batch_size is None:
-        batch_size = sl.get("batch_size", 1)
-    batch_max_cells = getattr(args, "batch_max_cells", None)
-    if batch_max_cells is None:
-        batch_max_cells = sl.get("batch_max_cells", 0)
-    batch_size = int(batch_size)
-    batch_max_cells = int(batch_max_cells or 0)
-    if batch_size < 1:
-        raise SystemExit("measure-stage2 --batch-size must be >= 1")
-    if batch_max_cells < 0:
-        raise SystemExit("measure-stage2 --batch-max-cells must be >= 0")
-
-    chunks = _pack_stage2_chunks(cfg, todo, batch_size, batch_max_cells)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    chunk_list, _ = _write_stage2_chunk_manifests(cfg, chunks, f"manifest_stage2_{stamp}")
-    sb = os.path.join(cfg["_dirs"]["jobs"], f"measure_stage2_{stamp}.sbatch")
-    q = shlex.quote
-    with open(sb, "w") as fh:
-        fh.write(f"""#!/bin/bash
-#SBATCH --job-name=efs-stage2
-#SBATCH -p {sl['partition']}
-#SBATCH --time={sl['time']}
-#SBATCH --mem={sl['mem']}
-#SBATCH --cpus-per-task={sl['cpus']}
-#SBATCH --array=1-{len(chunks)}%{sl['array_throttle']}
-#SBATCH --output={cfg['_dirs']['logs']}/%A_%a.out
-set -euo pipefail
-export OMP_NUM_THREADS={sl['cpus']}
-export OPENBLAS_NUM_THREADS={sl['cpus']}
-export MKL_NUM_THREADS={sl['cpus']}
-CHUNK_MANIFEST=$(sed -n "${{SLURM_ARRAY_TASK_ID}}p" {q(chunk_list)})
-{q(cfg['venv_python'])} {q(os.path.join(HERE, 'worker_stage2.py'))} --config {q(cfg['_config_path'])} --manifest "$CHUNK_MANIFEST"
-""")
-    res = subprocess.run(["sbatch", sb], capture_output=True, text=True)
-    print(res.stdout.strip() or res.stderr.strip())
-    jid = res.stdout.strip().split()[-1] if res.returncode == 0 else None
-    max_cells = batch_max_cells if batch_max_cells > 0 else "off"
-    print(f"submitted stage2 array of {len(chunks)} task(s) for {len(todo)} dataset(s) "
-          f"[{sl['array_throttle']} concurrent, batch_size={batch_size}, "
-          f"batch_max_cells={max_cells}]")
-    return jid
-
-
-def cmd_measure(cfg, args):
-    return [cmd_measure_stage1(cfg, args), cmd_measure_stage2(cfg, args)]
-
-
-def _write_stage2_manifest_file(path, records):
-    with open(path, "w") as fh:
-        for d in records:
-            fh.write(f"{d['key']}\t{d['species']}\t{d['h5ad']}\t{d['stage2_out']}\n")
-
-
-def _write_stage2_manifest(cfg, todo, prefix):
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    man = os.path.join(cfg["_dirs"]["jobs"], f"{prefix}_{stamp}.tsv")
-    _write_stage2_manifest_file(man, todo)
-    return man
-
-
-def _stage1_meta_n_cells(cfg, key):
-    path = os.path.join(cfg["_dirs"]["stage1"], key + ".meta.json")
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as fh:
-            n = json.load(fh).get("n_cells")
-        return int(n) if n is not None else None
-    except Exception:
-        return None
-
-
-def _record_n_cells(cfg, rec):
-    n = _stage1_meta_n_cells(cfg, rec["key"])
-    if n is not None:
-        return n
-    info = _h5ad_info(rec["h5ad"])
-    return info["n_obs"] if info is not None else None
-
-
-def _pack_stage2_chunks(cfg, records, batch_size, batch_max_cells=0):
-    """Pack small stage-2 datasets into one worker process.
-
-    The worker still processes one dataset at a time; this only amortizes Python
-    and Scanpy startup cost. ``batch_max_cells`` keeps large datasets isolated.
-    A value of 0 disables the cell-count packing guard.
-    """
-    if batch_size <= 1:
-        return [[r] for r in records]
-
-    max_cells = int(batch_max_cells or 0)
-    chunks, cur, cur_cells = [], [], 0
-    for rec in records:
-        n_cells = _record_n_cells(cfg, rec)
-        est_cells = int(n_cells) if n_cells is not None else (max_cells if max_cells > 0 else 0)
-        would_exceed_count = len(cur) >= batch_size
-        would_exceed_cells = bool(max_cells > 0 and cur and cur_cells + est_cells > max_cells)
-        if would_exceed_count or would_exceed_cells:
-            chunks.append(cur)
-            cur, cur_cells = [], 0
-
-        cur.append(rec)
-        cur_cells += est_cells
-        if max_cells > 0 and est_cells >= max_cells:
-            chunks.append(cur)
-            cur, cur_cells = [], 0
-
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def _write_stage2_chunk_manifests(cfg, chunks, prefix):
-    chunk_paths = []
-    for i, chunk in enumerate(chunks, 1):
-        path = os.path.join(cfg["_dirs"]["jobs"], f"{prefix}_chunk_{i:04d}.tsv")
-        _write_stage2_manifest_file(path, chunk)
-        chunk_paths.append(path)
-    chunk_list = os.path.join(cfg["_dirs"]["jobs"], f"{prefix}_chunks.tsv")
-    with open(chunk_list, "w") as fh:
-        for path in chunk_paths:
-            fh.write(path + "\n")
-    return chunk_list, chunk_paths
-
-
-def cmd_measure_stage2_local(cfg, args):
-    ds = [_stage2_record(cfg, d) for d in scan_corpus(cfg)]
-    todo = ds if args.force else [d for d in ds if d["stage2_stale"]]
-    if args.limit is not None:
-        todo = todo[:args.limit]
-    if not todo:
-        print("nothing to measure-stage2-local (all up-to-date). use --force to recompute.")
-        return None
-    man = _write_stage2_manifest(cfg, todo, "manifest_stage2_local")
-    cmd = [cfg["venv_python"], os.path.join(HERE, "worker_stage2.py"),
-           "--config", cfg["_config_path"], "--manifest", man]
-    print(f"running {len(todo)} stage2 task(s) locally in one Python process", flush=True)
-    subprocess.run(cmd, check=True)
-    return None
+    print(f"submitted array of {len(todo)} task(s) [{sl['array_throttle']} concurrent]")
+    return res.stdout.strip().split()[-1] if res.returncode == 0 else None
 
 
 def _wait(jid):
@@ -470,208 +173,272 @@ def _wait(jid):
         time.sleep(20)
 
 
-# ------------------------------------------------------------------- aggregate
-def aggregate(cfg):
-    records = scan_corpus(cfg)
-    species_by_key = {d["key"]: d["species"] for d in records}
-    keys = set(species_by_key)  # only datasets currently in the corpus
-    files = [os.path.join(cfg["_dirs"]["stage1"], k + ".parquet") for k in keys]
-    files = [f for f in files if os.path.exists(f)]
-    if not files:
-        raise SystemExit("no stage-1 outputs yet; run `measure` first")
-    df = pd.concat((pd.read_parquet(f) for f in files), ignore_index=True)
-    df["species"] = df["sample_key"].map(species_by_key).fillna(df["species"])
-    df["det"] = df["n_detected"] / df["n_cells"]
-    df["mean_all"] = df["sum_counts"] / df["n_cells"]
-    df["mean_expr"] = df["sum_counts"] / df["n_detected"].where(df["n_detected"] > 0)
-    md = cfg["_dirs"]["master"]
-    print(f"aggregating {len(files)} datasets, {len(df)} (dataset,gene) rows")
-    for sp, g in df.groupby("species"):
-        det = g.pivot_table(index="harmonized_id", columns="sample_key", values="det")
-        mean = g.pivot_table(index="harmonized_id", columns="sample_key", values="mean_all")
-        det.to_parquet(os.path.join(md, f"det_matrix_{sp}.parquet"))
-        mean.to_parquet(os.path.join(md, f"mean_matrix_{sp}.parquet"))
-        summary = pd.DataFrame(index=det.index)
-        summary["n_datasets_present"] = det.notna().sum(axis=1)
-        for t in DET_THRESH:
-            summary[f"n_datasets_det_{t}"] = (det >= t).sum(axis=1)
-        summary["max_det"] = det.max(axis=1)
-        summary["median_det_present"] = det.median(axis=1)
-        summary["max_mean_all"] = mean.max(axis=1)
-        extra = g.groupby("harmonized_id").agg(
-            tot_detected=("n_detected", "sum"), tot_cells_present=("n_cells", "sum"),
-            max_mean_expr=("mean_expr", "max"))
-        summary = summary.join(extra)
-        summary["pooled_det"] = summary["tot_detected"] / summary["tot_cells_present"]
-        summary = summary.reset_index()
-        ref = os.path.join(cfg["_dirs"]["ref"], f"biotype_{sp}.parquet")
-        if os.path.exists(ref):
-            summary = summary.merge(pd.read_parquet(ref), on="harmonized_id", how="left")
-        summary.to_parquet(os.path.join(md, f"gene_summary_{sp}.parquet"), index=False)
-        print(f"  [{sp}] datasets={g['sample_key'].nunique()} genes={det.shape[0]}")
-
-
-# ---------------------------------------------------------------------- select
-def _selection_params(cfg, args):
-    d = selection_cfg(cfg)
-    det = d["detection_rule"]
-    hvg = d["hvg_rule"]
-    deg = d["cluster_deg_rule"]
-    category_rule = d.get("category_rule", [])
-    if getattr(args, "category_rule", None):
-        category_rule = args.category_rule.split(",")
-    if getattr(args, "veto", None):
-        category_rule = args.veto.split(",")
-    return {
-        "min_frac": args.min_frac if getattr(args, "min_frac", None) is not None else det["min_frac"],
-        "min_dataset_occurrence": (
-            args.min_dataset_occurrence if getattr(args, "min_dataset_occurrence", None) is not None
-            else det["min_dataset_occurrence"]
-        ),
-        "hvg_min_datasets": (
-            args.hvg_min_datasets if getattr(args, "hvg_min_datasets", None) is not None
-            else hvg.get("min_datasets", 1)
-        ),
-        "deg_min_datasets": (
-            args.deg_min_datasets if getattr(args, "deg_min_datasets", None) is not None
-            else deg.get("min_datasets", 1)
-        ),
-        "category_rule": category_rule,
-    }
-
-
-def _read_stage2_current(cfg):
-    rows = []
-    records = [_stage2_record(cfg, d) for d in scan_corpus(cfg)]
-    missing, stale = 0, 0
-    cols = ["sample_key", "species", "harmonized_id", "selected_hvg", "selected_cluster_deg"]
-    for rec in records:
-        path = rec["stage2_out"]
-        if not os.path.exists(path):
+# ----------------------------------------------------------------------- build
+def _load_stats(cfg, ds):
+    """Cached per-dataset gene stats + per-(lineage, gene) HVG detail."""
+    frames, lineages, missing, stale = [], [], 0, 0
+    for rec in ds:
+        if not os.path.exists(rec["out"]):
             missing += 1
             continue
-        if rec["stage2_stale"]:
-            stale += 1
-        df = pd.read_parquet(path)
-        for c in cols:
-            if c not in df:
-                df[c] = False if c.startswith("selected_") else None
-        rows.append(df)
+        stale += bool(rec["stale"])
+        frames.append(pd.read_parquet(rec["out"]))
+        detail = os.path.splitext(rec["out"])[0] + ".lineages.parquet"
+        if os.path.exists(detail):
+            d = pd.read_parquet(detail)
+            d["species"] = rec["species"]
+            lineages.append(d)
     if missing or stale:
-        print(f"warning: build using stage2 cache with {stale} stale and {missing} missing dataset(s)")
-    if not rows:
+        print(f"warning: building with {stale} stale and {missing} missing dataset(s)")
+    if not frames:
+        raise SystemExit("no measurements yet; run `measure` first")
+    lin = pd.concat(lineages, ignore_index=True) if lineages else pd.DataFrame(
+        columns=["sample_key", "lineage", "lineage_cells", "harmonized_id", "species"])
+    return pd.concat(frames, ignore_index=True), lin
+
+
+def _passes(df, s_min, n_max):
+    """The selection rule, applied to any table with score + rank columns."""
+    return (df["rank"] > 0) & (df["rank"] <= n_max) & (df["score"] >= s_min)
+
+
+def _lineage_votes(lin, s_min, n_max, min_cells, min_lineages):
+    """(sample_key, harmonized_id) pairs where the gene passes in >= min_lineages
+    lineages of at least min_cells cells."""
+    cols = ["sample_key", "harmonized_id"]
+    if lin.empty:
         return pd.DataFrame(columns=cols)
-    return pd.concat(rows, ignore_index=True)
+    kept = lin[(lin["lineage_cells"] >= min_cells) & _passes(lin, s_min, n_max)]
+    per = kept.groupby(cols)["lineage"].nunique()
+    return per[per >= min_lineages].reset_index()[cols]
 
 
-def _support_counts(stage2, flag):
-    if stage2.empty or flag not in stage2:
-        return pd.Series(dtype=np.int64)
-    x = stage2[stage2[flag].fillna(False)]
-    if x.empty:
-        return pd.Series(dtype=np.int64)
-    return x.drop_duplicates(["sample_key", "harmonized_id"]).groupby("harmonized_id")["sample_key"].nunique()
+def _lineage_support(lin, s_min, n_max, min_cells, min_lineages):
+    """Datasets per gene that vote via their lineages."""
+    v = _lineage_votes(lin, s_min, n_max, min_cells, min_lineages)
+    return v.groupby("harmonized_id")["sample_key"].nunique() if len(v) else pd.Series(dtype=np.int64)
 
 
-def _add_ref_annotations(cfg, sp, frame):
+def _gene_table(df, s_min, n_max):
+    """Per-gene stats across datasets: HVG support + how highly it is expressed."""
+    df = df.copy()
+    df["det"] = df["n_detected"] / df["n_cells"]
+    # fillna before grouping: SeriesGroupBy.fillna returns a row-aligned Series,
+    # whose .sum() is a scalar that would silently broadcast over every gene.
+    df["hvg_upstream"] = (df["hvg_upstream"].fillna(False).astype(bool)
+                          if "hvg_upstream" in df else False)
+    df["hvg"] = _passes(df, s_min, n_max)
+    g = df.groupby("harmonized_id")
+    t = pd.DataFrame({
+        "n_datasets_present": g["sample_key"].nunique(),
+        "n_datasets_hvg_global": g["hvg"].sum().astype(int),
+        "n_datasets_hvg_upstream": g["hvg_upstream"].sum().astype(int),
+        "best_score": g["score"].max(),
+        "median_score": g["score"].median(),
+        "tot_detected": g["n_detected"].sum(),
+        "tot_cells": g["n_cells"].sum(),
+        "tot_counts": g["sum_counts"].sum(),
+        "max_det": g["det"].max(),
+        "median_det": g["det"].median(),
+    })
+    t["pooled_det"] = t["tot_detected"] / t["tot_cells"]
+    t["mean_counts_per_cell"] = t["tot_counts"] / t["tot_cells"]
+    t["mean_counts_in_positive"] = t["tot_counts"] / t["tot_detected"].where(t["tot_detected"] > 0)
+    return t.drop(columns=["tot_detected", "tot_counts"])
+
+
+def _union_support(sub, lin, s_min, n_max, min_cells, min_lineages):
+    """Datasets per gene voting through the dataset-level call OR their lineages."""
+    glob = sub[_passes(sub, s_min, n_max)][["sample_key", "harmonized_id"]]
+    via_lin = _lineage_votes(lin, s_min, n_max, min_cells, min_lineages)
+    both = pd.concat([glob, via_lin], ignore_index=True).drop_duplicates()
+    return both.groupby("harmonized_id")["sample_key"].nunique()
+
+
+def _annotate(cfg, sp, t):
     ref = os.path.join(cfg["_dirs"]["ref"], f"biotype_{sp}.parquet")
-    if not os.path.exists(ref):
-        return frame
-    r = pd.read_parquet(ref).set_index("harmonized_id")
-    for col in r.columns:
-        if col not in frame:
-            frame[col] = r[col].reindex(frame.index)
-        else:
-            frame[col] = frame[col].combine_first(r[col].reindex(frame.index))
-    return frame
-
-
-def _prepare_category_flags(frame):
+    if os.path.exists(ref):
+        t = t.join(pd.read_parquet(ref).set_index("harmonized_id"), how="left")
+    if "biotype" not in t:
+        t["biotype"] = None
     for c in FLAGCOLS:
-        frame[c] = frame[c].fillna(False).astype(bool) if c in frame else False
-    if "biotype" not in frame:
-        frame["biotype"] = None
-    bt = frame["biotype"].fillna("")
-    frame["is_pseudogene"] = frame["is_pseudogene"] | bt.str.contains("pseudogene", case=False, na=False)
-    frame["veto_narrow"] = frame[NARROW].any(axis=1)
-    frame["veto_wide"] = frame["veto_narrow"] | (bt.ne("protein_coding") & bt.ne(""))
-    return frame
+        t[c] = t[c].fillna(False).astype(bool) if c in t else False
+    return t
 
 
-def select_snapshot(cfg, params, tag):
-    aggregate(cfg)
-    md = cfg["_dirs"]["master"]
-    stage2 = _read_stage2_current(cfg)
-    tag = tag or time.strftime("%Y%m%d-%H%M%S")
+def _flag_any(t, flags):
+    unknown = [c for c in flags if c not in t.columns]
+    if unknown:
+        raise SystemExit(f"unknown category flag(s): {unknown} (available: {FLAGCOLS})")
+    return t[flags].any(axis=1) if flags else pd.Series(False, index=t.index)
+
+
+def _category_mask(t, key):
+    """A rule key is either an is_* flag column or an exact Ensembl biotype."""
+    if key in FLAGCOLS:
+        return t[key].astype(bool)
+    return t["biotype"].fillna("") == key
+
+
+def _min_datasets(t, rules):
+    """Per-gene HVG-support threshold. First matching rule wins (config order),
+    so put narrow categories above broad ones; `default` covers the rest."""
+    out = pd.Series(int(rules.get("default", 1)), index=t.index, dtype=int)
+    taken = pd.Series(False, index=t.index)
+    seen_biotypes = set(t["biotype"].dropna())
+    for key, val in rules.items():
+        if key == "default":
+            continue
+        if key not in FLAGCOLS and key not in seen_biotypes:
+            print(f"    warning: rule key {key!r} matches no gene "
+                  f"(not an is_* flag, not a biotype in this corpus)")
+        m = _category_mask(t, key) & ~taken
+        out[m] = int(val)
+        taken |= m
+    return out
+
+
+def _threshold_table(t, ks=(1, 2, 3, 5, 10, 20, 50)):
+    """How many genes per category survive at each candidate threshold."""
+    rows = []
+    for label, sub in [("ALL", t)] + [(b, g) for b, g in t.groupby(t["biotype"].fillna("(none)"))]:
+        row = {"category": label, "genes_seen": len(sub)}
+        row.update({f"hvg_ge_{k}": int((sub["n_datasets_hvg"] >= k).sum()) for k in ks})
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("genes_seen", ascending=False)
+
+
+def _sweep_table(sub, lin, rules, min_cells, min_lineages, ref_biotype,
+                 s_mins=(1.1, 1.2, 1.3, 1.5, 2.0), n_max=3000):
+    """How many genes the category rules would select at each s_min, and how the
+    per-dataset vote size moves with it. Answers "is s_min too strict?" at the
+    corpus level without remeasuring."""
+    rows = []
+    for s_min in s_mins:
+        votes = _union_support(sub, lin, s_min, n_max, min_cells, min_lineages)
+        per_ds = pd.concat([sub[_passes(sub, s_min, n_max)][["sample_key", "harmonized_id"]],
+                            _lineage_votes(lin, s_min, n_max, min_cells, min_lineages)]
+                           ).drop_duplicates().groupby("sample_key").size()
+        t = pd.DataFrame({"n_datasets_hvg": votes})
+        t["biotype"] = ref_biotype.reindex(t.index) if ref_biotype is not None else None
+        req = _min_datasets(_with_flags(t), rules)
+        sel = t["n_datasets_hvg"] >= req
+        rows.append({"s_min": s_min, "votes_per_dataset_median": int(per_ds.median()) if len(per_ds) else 0,
+                     "votes_per_dataset_min": int(per_ds.min()) if len(per_ds) else 0,
+                     "votes_per_dataset_max": int(per_ds.max()) if len(per_ds) else 0,
+                     "genes_with_any_vote": int(len(t)),
+                     "selected_by_category_rules": int(sel.sum()),
+                     "selected_protein_coding": int((sel & (t["biotype"] == "protein_coding")).sum()),
+                     "selected_lncRNA": int((sel & (t["biotype"] == "lncRNA")).sum())})
+    return pd.DataFrame(rows)
+
+
+def _with_flags(t):
+    for c in FLAGCOLS:
+        if c not in t:
+            t[c] = False
+    return t
+
+
+def _parse_min_rules(spec, base):
+    """--hvg-min-datasets accepts a bare int (flat) or `key=n,key=n` overrides."""
+    if spec is None:
+        return dict(base)
+    if spec.strip().lstrip("-").isdigit():
+        return {"default": int(spec)}
+    rules = dict(base)
+    for part in spec.split(","):
+        key, _, val = part.partition("=")
+        if not val:
+            raise SystemExit(f"--hvg-min-datasets: expected key=n, got {part!r}")
+        rules[key.strip()] = int(val)
+    return rules
+
+
+def cmd_build(cfg, args):
+    sel = cfg["selection"]
+    base = sel.get("hvg_min_datasets", 1)
+    base = {"default": int(base)} if isinstance(base, int) else dict(base or {})
+    rules = _parse_min_rules(args.hvg_min_datasets, base)
+    keep = (args.category_keep.split(",") if args.category_keep is not None
+            else sel.get("category_keep", []) or [])
+    drop = (args.category_drop.split(",") if args.category_drop is not None
+            else sel.get("category_drop", []) or [])
+    source = args.hvg_source or sel.get("hvg_source", "union")
+    if source not in HVG_SOURCES:
+        raise SystemExit(f"--hvg-source must be one of {HVG_SOURCES}")
+    min_cells = (args.min_lineage_cells if args.min_lineage_cells is not None
+                 else sel.get("min_lineage_cells", 200))
+    min_lineages = (args.min_lineages if args.min_lineages is not None
+                    else sel.get("min_lineages", 1))
+    s_min = args.s_min if args.s_min is not None else float(sel.get("s_min", 1.5))
+    n_max = args.n_max if args.n_max is not None else int(sel.get("n_max", 3000))
+    print(f"selecting (hvg_source={source}, s_min={s_min}, n_max={n_max}, "
+          f"min_lineage_cells={min_cells}, min_lineages={min_lineages}, "
+          f"hvg_min_datasets={rules}, category_keep={keep or 'none'}, category_drop={drop or 'none'})")
+
+    ds = scan_inputs(cfg)
+    stats, lin = _load_stats(cfg, ds)
+    tag = args.tag or time.strftime("%Y%m%d-%H%M%S")
     outdir = os.path.join(cfg["_dirs"]["vocab"], tag)
     os.makedirs(outdir, exist_ok=True)
     counts = {}
     for sp in SPECIES:
-        gs = os.path.join(md, f"gene_summary_{sp}.parquet")
-        det_path = os.path.join(md, f"det_matrix_{sp}.parquet")
-        if not os.path.exists(gs) or not os.path.exists(det_path):
+        sub = stats[stats["species"] == sp]
+        if sub.empty:
             continue
-        summary = pd.read_parquet(gs).set_index("harmonized_id")
-        det = pd.read_parquet(det_path)
-        sp_stage2 = stage2[stage2["species"] == sp].copy()
-        hvg_counts = _support_counts(sp_stage2, "selected_hvg")
-        deg_counts = _support_counts(sp_stage2, "selected_cluster_deg")
+        t = _annotate(cfg, sp, _gene_table(sub, s_min, n_max))
+        lin_sp = lin[lin["species"] == sp]
+        lin_sup = _lineage_support(lin_sp, s_min, n_max, min_cells, min_lineages)
+        t["n_datasets_hvg_lineage"] = lin_sup.reindex(t.index).fillna(0).astype(int)
+        if source == "union":   # a dataset votes via its global call OR its lineages
+            t["n_datasets_hvg"] = _union_support(sub, lin_sp, s_min, n_max, min_cells,
+                                                 min_lineages).reindex(t.index).fillna(0).astype(int)
+        else:
+            t["n_datasets_hvg"] = t[f"n_datasets_hvg_{source}"]
+        t["min_datasets_required"] = _min_datasets(t, rules)
+        t["hvg_union"] = t["n_datasets_hvg"] >= t["min_datasets_required"]
+        t["category_kept"] = _flag_any(t, keep)     # force-in, overrides drop
+        t["category_dropped"] = _flag_any(t, drop) & ~t["category_kept"]
+        t["selected"] = (t["hvg_union"] | t["category_kept"]) & ~t["category_dropped"]
+        t.index.name = "harmonized_id"
 
-        n_det = (det >= params["min_frac"]).sum(axis=1)
-        idx = summary.index.union(hvg_counts.index).union(deg_counts.index).union(n_det.index)
-        s = summary.reindex(idx)
-        s = _add_ref_annotations(cfg, sp, s)
-        s = _prepare_category_flags(s)
-
-        s["n_datasets_detection"] = n_det.reindex(idx).fillna(0).astype(int)
-        s["n_datasets_hvg"] = hvg_counts.reindex(idx).fillna(0).astype(int)
-        s["n_datasets_cluster_deg"] = deg_counts.reindex(idx).fillna(0).astype(int)
-        s["selected_by_detection"] = s["n_datasets_detection"] >= params["min_dataset_occurrence"]
-        s["selected_by_hvg"] = s["n_datasets_hvg"] >= params["hvg_min_datasets"]
-        s["selected_by_cluster_deg"] = s["n_datasets_cluster_deg"] >= params["deg_min_datasets"]
-        s["candidate"] = s["selected_by_detection"] | s["selected_by_hvg"] | s["selected_by_cluster_deg"]
-
-        cand = s[s["candidate"]].copy()
-        unknown = [c for c in params["category_rule"] if c not in cand.columns]
-        if unknown:
-            raise SystemExit(f"unknown category_rule flag(s): {unknown}")
-        applied = cand[params["category_rule"]].any(axis=1) if params["category_rule"] else pd.Series(False, index=cand.index)
-        cand["category_excluded"] = applied
-        cand["selected"] = ~applied
-        cand.index.name = "harmonized_id"
-
-        cols = (["symbol", "biotype", "selected", "category_excluded",
-                 "selected_by_detection", "selected_by_hvg", "selected_by_cluster_deg",
-                 "n_datasets_detection", "n_datasets_hvg", "n_datasets_cluster_deg",
-                 "n_datasets_present", "max_det", "median_det_present", "pooled_det",
-                 "veto_narrow", "veto_wide"] + FLAGCOLS)
-        cols = [c for c in cols if c in cand.columns]
-        cand[cols].sort_values(
-            ["selected", "selected_by_detection", "n_datasets_detection",
-             "n_datasets_hvg", "n_datasets_cluster_deg"],
-            ascending=False,
+        cols = (["symbol", "biotype", "selected", "hvg_union", "category_kept",
+                 "category_dropped", "n_datasets_hvg", "min_datasets_required",
+                 "n_datasets_hvg_global", "n_datasets_hvg_lineage",
+                 "n_datasets_hvg_upstream", "best_score", "median_score", "n_datasets_present",
+                 "pooled_det", "max_det", "median_det", "mean_counts_per_cell",
+                 "mean_counts_in_positive"] + FLAGCOLS)
+        t[[c for c in cols if c in t]].sort_values(
+            ["selected", "n_datasets_hvg", "pooled_det"], ascending=False
         ).to_csv(os.path.join(outdir, f"vocab_{sp}.tsv"), sep="\t")
+        # tuning aids: gene counts per biotype at a range of dataset thresholds, and
+        # the whole selection re-run at a range of s_min
+        _threshold_table(t).to_csv(os.path.join(outdir, f"thresholds_{sp}.tsv"),
+                                   sep="\t", index=False)
+        ref_bt = t["biotype"] if "biotype" in t else None
+        sweep = _sweep_table(sub, lin_sp, rules, min_cells, min_lineages, ref_bt, n_max=n_max)
+        sweep.to_csv(os.path.join(outdir, f"sweep_smin_{sp}.tsv"), sep="\t", index=False)
+        print("      s_min sweep (votes/dataset median, selected):",
+              "  ".join(f"{r.s_min}: {r.votes_per_dataset_median}/{r.selected_by_category_rules}"
+                        for r in sweep.itertuples()))
 
-        counts[sp] = {
-            "candidate": int(len(cand)),
-            "selected": int(cand["selected"].sum()),
-            "detection": int(cand["selected_by_detection"].sum()),
-            "hvg": int(cand["selected_by_hvg"].sum()),
-            "cluster_deg": int(cand["selected_by_cluster_deg"].sum()),
-        }
-        print(f"  [{sp}] candidate={counts[sp]['candidate']} selected={counts[sp]['selected']} "
-              f"detection={counts[sp]['detection']} hvg={counts[sp]['hvg']} "
-              f"cluster_deg={counts[sp]['cluster_deg']}")
+        counts[sp] = {"genes_seen": int(len(t)), "hvg_union": int(t["hvg_union"].sum()),
+                      "selected": int(t["selected"].sum()),
+                      "datasets": int(sub["sample_key"].nunique())}
+        print(f"  [{sp}] datasets={counts[sp]['datasets']} genes_seen={counts[sp]['genes_seen']} "
+              f"hvg_union={counts[sp]['hvg_union']} selected={counts[sp]['selected']}")
+        by_bt = t[t["selected"]].groupby(t["biotype"].fillna("(none)")).size().sort_values(ascending=False)
+        for bt, n in by_bt.head(8).items():
+            print(f"      {bt:<28} {n:6}")
 
-    meta = {
-        "policy": "current",
-        "tag": tag,
-        "selection": params,
-        "stage2_measure_signature": stage2_measure_signature(cfg),
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "counts": counts,
-    }
-    json.dump(meta, open(os.path.join(outdir, "params.json"), "w"), indent=2)
+    json.dump({"tag": tag, "hvg": cfg["hvg"], "hvg_source": source,
+               "s_min": s_min, "n_max": n_max,
+               "min_lineage_cells": min_cells, "min_lineages": min_lineages,
+               "hvg_min_datasets": rules,
+               "category_keep": keep, "category_drop": drop, "counts": counts,
+               "created": time.strftime("%Y-%m-%d %H:%M:%S")},
+              open(os.path.join(outdir, "params.json"), "w"), indent=2)
     latest = os.path.join(cfg["_dirs"]["vocab"], "latest")
     if os.path.islink(latest) or os.path.exists(latest):
         os.remove(latest)
@@ -679,62 +446,9 @@ def select_snapshot(cfg, params, tag):
     print(f"-> snapshot {outdir}  (latest -> {tag})")
 
 
-def cmd_build(cfg, args):
-    params = _selection_params(cfg, args)
-    print("selecting "
-          f"(min_frac={params['min_frac']}, min_dataset_occurrence={params['min_dataset_occurrence']}, "
-          f"hvg_min_datasets={params['hvg_min_datasets']}, "
-          f"deg_min_datasets={params['deg_min_datasets']}, "
-          f"category_rule={params['category_rule'] or 'none'})")
-    select_snapshot(cfg, params, args.tag)
-
-
 def cmd_refresh(cfg, args):
-    for jid in cmd_measure(cfg, args):
-        _wait(jid)
+    _wait(cmd_measure(cfg, args))
     cmd_build(cfg, args)
-
-
-# ------------------------------------------------------------------------ diff
-def _load_vocab(cfg, tag, sp):
-    p = os.path.join(cfg["_dirs"]["vocab"], tag, f"vocab_{sp}.tsv")
-    d = pd.read_csv(p, sep="\t", index_col=0)
-    return d[d["selected"]] if "selected" in d else d
-
-
-def cmd_diff(cfg, args):
-    for sp in SPECIES:
-        try:
-            a = _load_vocab(cfg, args.a, sp)
-            b = _load_vocab(cfg, args.b, sp)
-        except FileNotFoundError:
-            continue
-        A, B = set(a.index), set(b.index)
-        added, removed = B - A, A - B
-        print(f"\n[{sp}] {args.a}({len(A)}) -> {args.b}({len(B)})  "
-              f"+{len(added)} / -{len(removed)}")
-        for label, ids in [("added", added), ("removed", removed)]:
-            ref = b if label == "added" else a
-            ex = [f"{i}({ref.loc[i, 'symbol']})" for i in list(ids)[:8] if i in ref.index]
-            if ex:
-                print(f"    {label}: " + ", ".join(ex) + (" ..." if len(ids) > 8 else ""))
-
-
-def cmd_list(cfg, args):
-    vd = cfg["_dirs"]["vocab"]
-    for tag in sorted(os.listdir(vd)):
-        p = os.path.join(vd, tag, "params.json")
-        if os.path.exists(p):
-            m = json.load(open(p))
-            c = m.get("counts", {})
-            sel = {sp: c[sp]["selected"] for sp in c}
-            if m.get("policy") in {"current", "v2"} or "selection" in m or "select_v2" in m:
-                params = m.get("selection", m.get("select_v2", {}))
-                print(f"  {tag}  min_frac={params.get('min_frac')} "
-                      f"min_dataset_occurrence={params.get('min_dataset_occurrence')} "
-                      f"category_rule={params.get('category_rule') or 'none'}  selected={sel}")
-            else:
-                print(f"  {tag}  legacy selection  selected={sel}")
 
 
 # ------------------------------------------------------------ biotype reference
@@ -757,11 +471,13 @@ def _parse_gtf(path):
             gid = a.get("gene_id", "")
             if gid:
                 rows.append((gid.split(".")[0], a.get("gene_name", ""), a.get("gene_biotype", "")))
-    return pd.DataFrame(rows, columns=["harmonized_id", "symbol", "biotype"]).drop_duplicates("harmonized_id")
+    return pd.DataFrame(rows, columns=["harmonized_id", "symbol", "biotype"]) \
+             .drop_duplicates("harmonized_id")
 
 
 def _add_flags(df, sp):
     s, bt = df["symbol"].fillna(""), df["biotype"].fillna("")
+    df["is_protein_coding"] = bt == "protein_coding"
     df["is_pseudogene"] = bt.str.contains("pseudogene", case=False, na=False)
     if sp == "human":
         df["is_OR"] = s.str.match(r"^OR\d")
@@ -801,8 +517,7 @@ def cmd_ref(cfg, args):
             urllib.request.urlretrieve(url, gz)
         df = _add_flags(_parse_gtf(gz), sp)
         df.to_parquet(out, index=False)
-        print(f"[{sp}] genes={len(df)} protein_coding="
-              f"{int((df['biotype'] == 'protein_coding').sum())} -> {out}")
+        print(f"[{sp}] genes={len(df)} protein_coding={int(df['is_protein_coding'].sum())} -> {out}")
 
 
 # ------------------------------------------------------------------------- main
@@ -813,49 +528,38 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
 
-    def add_stage2_batch_opts(p):
-        p.add_argument("--batch-size", type=int,
-                       help="datasets per stage2 array task; default from slurm_stage2.batch_size")
-        p.add_argument("--batch-max-cells", type=int,
-                       help="max total cells per stage2 array task; 0 disables this guard")
+    def add_measure_opts(p):
+        p.add_argument("--force", action="store_true")
+        p.add_argument("--local", action="store_true", help="run here instead of via sbatch")
+        p.add_argument("--jobs", type=int, help="processes for --local (default: CPUs available)")
+    add_measure_opts(sub.add_parser("measure"))
+    sub.add_parser("ref").add_argument("--force", action="store_true")
 
-    m = sub.add_parser("measure")
-    m.add_argument("--force", action="store_true")
-    add_stage2_batch_opts(m)
-    m1 = sub.add_parser("measure-stage1")
-    m1.add_argument("--force", action="store_true")
-    m2 = sub.add_parser("measure-stage2")
-    m2.add_argument("--force", action="store_true")
-    add_stage2_batch_opts(m2)
-    m2l = sub.add_parser("measure-stage2-local")
-    m2l.add_argument("--force", action="store_true")
-    m2l.add_argument("--limit", type=int, help="run only the first N stale/missing stage2 datasets")
-    r = sub.add_parser("ref"); r.add_argument("--force", action="store_true")
-
-    def add_build_opts(p, include_force=False):
-        p.add_argument("--min-frac", type=float)
-        p.add_argument("--min-dataset-occurrence", type=int)
-        p.add_argument("--hvg-min-datasets", type=int)
-        p.add_argument("--deg-min-datasets", type=int)
-        p.add_argument("--category-rule")
-        p.add_argument("--veto", help=argparse.SUPPRESS)
+    def add_build_opts(p):
+        p.add_argument("--hvg-min-datasets", metavar="N|KEY=N,...",
+                       help="flat threshold, or per-category overrides on top of config "
+                            "(e.g. protein_coding=3,lncRNA=10)")
+        p.add_argument("--hvg-source", choices=HVG_SOURCES,
+                       help="which per-dataset HVG call votes: union (global+lineage), "
+                            "global, lineage, or upstream (the rsi pipeline's)")
+        p.add_argument("--s-min", type=float, help="score (standardized variance) a gene needs in a group")
+        p.add_argument("--n-max", type=int, help="rank cap within a group")
+        p.add_argument("--min-lineage-cells", type=int,
+                       help="ignore lineages smaller than this (>= the measurement floor)")
+        p.add_argument("--min-lineages", type=int,
+                       help="gene must be HVG in this many lineages for that dataset to vote")
+        p.add_argument("--category-keep", help="comma-separated flags to force-include")
+        p.add_argument("--category-drop", help="comma-separated flags to exclude")
         p.add_argument("--tag")
-        if include_force:
-            p.add_argument("--force", action="store_true")
     add_build_opts(sub.add_parser("build"))
     refresh = sub.add_parser("refresh")
-    add_build_opts(refresh, include_force=True)
-    add_stage2_batch_opts(refresh)
-    d = sub.add_parser("diff"); d.add_argument("a"); d.add_argument("b")
-    sub.add_parser("list")
+    add_build_opts(refresh)
+    add_measure_opts(refresh)
 
     args = ap.parse_args()
     cfg = load_config(args.config)
-    {"status": cmd_status, "measure": cmd_measure,
-     "measure-stage1": cmd_measure_stage1, "measure-stage2": cmd_measure_stage2,
-     "measure-stage2-local": cmd_measure_stage2_local,
-     "ref": cmd_ref, "build": cmd_build, "refresh": cmd_refresh,
-     "diff": cmd_diff, "list": cmd_list}[args.cmd](cfg, args)
+    {"status": cmd_status, "measure": cmd_measure, "ref": cmd_ref,
+     "build": cmd_build, "refresh": cmd_refresh}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":
