@@ -1,0 +1,43 @@
+{
+  "human_vocab": "human-v1",
+  "mouse_vocab": "mouse-v2",
+  "human_genes": 20956,
+  "mouse_genes": 19131,
+  "human_mouse_pairs_in_table": 17108,
+  "kept_pairs": 15805,
+  "kept_pairs_by_type": {
+    "ortholog_one2one": 15118,
+    "ortholog_one2many": 540,
+    "ortholog_many2many": 147
+  },
+  "shared_human_genes": 15630,
+  "shared_mouse_genes": 15666,
+  "shared_one2one_genes": 15118,
+  "unmapped_human": {
+    "no ortholog in the table": 5092,
+    "ortholog(s) exist but none is in the other vocabulary": 227,
+    "no Ensembl id (MGI/HGNC accession): not in the ortholog table": 7
+  },
+  "unmapped_mouse": {
+    "no ortholog in the table": 3162,
+    "ortholog(s) exist but none is in the other vocabulary": 238,
+    "no Ensembl id (MGI/HGNC accession): not in the ortholog table": 65
+  },
+  "unmapped_human_by_biotype": {
+    "lncRNA": 2741,
+    "protein_coding": 2543,
+    "(none)": 26,
+    "IG_C_gene": 9,
+    "TR_C_gene": 3,
+    "transcribed_unitary_pseudogene": 1,
+    "transcribed_unprocessed_pseudogene": 1,
+    "complex_locus_constituent": 1,
+    "readthrough": 1
+  },
+  "unmapped_mouse_by_biotype": {
+    "protein_coding": 2763,
+    "lncRNA": 689,
+    "IG_C_gene": 8,
+    "TR_C_gene": 5
+  }
+}

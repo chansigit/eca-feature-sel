@@ -12,3 +12,6 @@ __pycache__/
 config.local.yaml
 # graphify skill output (local knowledge graph, not source)
 graphify-out/
+# ortholog table copied from genofoundation (1.4 MB, Ensembl 111); regenerate with orthologs/README.md
+orthologs/pairs.parquet
+!orthologs/*.tsv
