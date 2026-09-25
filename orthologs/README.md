@@ -28,6 +28,14 @@ Of the unmapped genes, lncRNAs are almost all of the human non-protein-coding
 loss (2,741) and every mouse lncRNA (689) is unmapped: the table has few
 lncRNA orthologs.
 
+**Caveat: the table holds only Ensembl's high-confidence pairs** (all 17,108
+human–mouse rows have `confidence == 1`, covering 16,533 human / 16,694 mouse
+genes). Well-known orthologs that Ensembl marks low-confidence are therefore
+missing: SRGN/Srgn, MKI67/Mki67, FTH1/Fth1, CD68/Cd68, CCL2/Ccl2, CXCL2/Cxcl2,
+CTSL/Ctsl, TMSB4X/Tmsb4x. Among the genes unmapped on both sides, 857 share the
+same symbol case-insensitively (802 protein-coding); a table that includes
+low-confidence pairs would rescue at least those.
+
 ## Files
 
 | file | what |
