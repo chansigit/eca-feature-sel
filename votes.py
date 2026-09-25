@@ -196,3 +196,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    fs.fs_exit(0)   # scan_inputs may leave a child stuck in an Oak call

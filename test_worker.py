@@ -2,6 +2,7 @@
 """Self-check: python test_worker.py  (needs anndata + scanpy in the venv)."""
 import json
 import os
+import time
 import tempfile
 
 import anndata
@@ -298,8 +299,25 @@ def test_expected_sd_falls_back_when_loess_fails():
 
 
 
+def _slow_or_fast(x):
+    import time
+    if x == "slow":
+        time.sleep(30)
+    return x.upper()
+
+
+def test_fs_parallel_defers_hung_calls():
+    t0 = time.time()
+    res, deferred = featuresel.fs_parallel(_slow_or_fast, ["a", "slow", "b"], timeout=2)
+    assert res == {"a": "A", "b": "B"}, res
+    assert deferred == ["slow"], deferred
+    assert time.time() - t0 < 10          # the deadline held; the sleeper was abandoned
+    print("[fs_parallel] fast items returned, slow one deferred")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
             fn()
             print(f"ok {name}")
+    featuresel.fs_exit(0)   # do not wait for the deliberately hung child

@@ -218,3 +218,9 @@ docs/            selection_design.md: rules, flags, stat columns, costs
   ortholog mapping.
 - The whole thing is I/O bound. On a shared filesystem the streaming read runs
   at the node's bandwidth; more CPUs help linearly, a faster language would not.
+- **Slow filesystem days.** Every filesystem call (directory scan, stat, open)
+  runs in a forked child with a deadline (`scan_rsi.py --timeout`, default 120 s;
+  `measure --timeout` per dataset, default 1800 s). Whatever does not answer is
+  *deferred*: the scan keeps that dataset's row from the previous TSV, `status`
+  and `build` use its cached measurement, and the next run checks it again.
+  Nothing is ever dropped because a mount hung.

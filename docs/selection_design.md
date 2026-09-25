@@ -148,6 +148,16 @@ matrix from 22 s to 0.5 s. With 5 local processes the 160-dataset mouse corpus
 practice because of queueing. Pearson residuals need dense O(cells x genes)
 work (125 s on Brain) and are kept only for comparison.
 
+## Filesystem hangs
+
+Oak can hang a single `stat()` or `open()` for minutes. Every filesystem call in
+the pipeline goes through `featuresel.fs_parallel`: one forked child per item, a
+deadline for the batch, stragglers killed and reported as *deferred*. Threads or a
+process pool cannot do this: a child stuck in an uninterruptible Lustre call is
+never joinable, so callers end with `fs_exit()` (`os._exit`) and leave it behind.
+Deferred datasets keep their previous TSV row and their cached measurement; the
+next `scan_rsi.py` / `measure` run picks them up again.
+
 ## Caching
 
 Per-dataset measurement (`cache/stats/<sample_key>.parquet`) holds one row per

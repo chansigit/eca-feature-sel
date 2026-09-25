@@ -266,6 +266,8 @@ def main():
     ap.add_argument("--manifest")
     ap.add_argument("--index", type=int, help="1-based line in manifest; omit to run all lines")
     ap.add_argument("--jobs", type=int, default=1, help="processes when running a whole manifest")
+    ap.add_argument("--timeout", type=int, default=1800,
+                    help="seconds a dataset may run before it is abandoned (Oak can hang a read)")
     ap.add_argument("--h5ad")
     ap.add_argument("--species")
     ap.add_argument("--sample-key")
@@ -277,16 +279,48 @@ def main():
         lines = [lines[a.index - 1]] if a.index else lines
     else:
         lines = ["\t".join([a.sample_key, a.species, a.h5ad, a.out])]
-    # biggest files first so the pool does not end on one 6 GB straggler
-    lines.sort(key=lambda ln: -os.path.getsize(ln.split("\t")[2]))
-    if a.jobs > 1 and len(lines) > 1:
-        import multiprocessing as mp
-        with mp.get_context("fork").Pool(a.jobs) as pool:
-            for _ in pool.imap_unordered(_run, [(cfg, ln) for ln in lines]):
-                pass
-    else:
-        for line in lines:
-            _run((cfg, line))
+    # biggest files first so the pool does not end on one 6 GB straggler; a file
+    # whose size cannot even be read in time is deferred right away
+    sizes, slow = featuresel.fs_parallel(os.path.getsize, [ln.split("\t")[2] for ln in lines])
+    for ln in lines:
+        if ln.split("\t")[2] in slow:
+            print(f"[{ln.split(chr(9))[0]}] deferred: stat() did not return in {featuresel.FS_TIMEOUT}s")
+    lines = sorted((ln for ln in lines if ln.split("\t")[2] in sizes),
+                   key=lambda ln: -sizes[ln.split("\t")[2]])
+    deferred = run_pool(cfg, lines, a.jobs, a.timeout)
+    if deferred:
+        print(f"{len(deferred)} dataset(s) deferred (no result within {a.timeout}s): {', '.join(deferred)}")
+    featuresel.fs_exit(0)
+
+
+def run_pool(cfg, lines, jobs, timeout):
+    """One forked process per dataset, at most `jobs` at a time. A dataset still
+    running after `timeout` s is killed and reported; nothing is written for it,
+    so the next measure picks it up again. Hung children are never joined."""
+    import multiprocessing as mp
+    ctx = mp.get_context("fork")
+    pending, running, deferred = list(lines), {}, []
+    while pending or running:
+        while pending and len(running) < jobs:
+            ln = pending.pop(0)
+            p = ctx.Process(target=_run, args=((cfg, ln),), daemon=True)
+            p.start()
+            running[p] = (ln, time.time())
+        time.sleep(0.5)
+        for p in list(running):
+            ln, t0 = running[p]
+            key = ln.split("\t")[0]
+            if not p.is_alive():
+                p.join()
+                del running[p]
+                if p.exitcode:
+                    print(f"[{key}] failed (exit {p.exitcode})", flush=True)
+            elif time.time() - t0 > timeout:
+                p.kill()
+                del running[p]
+                deferred.append(key)
+                print(f"[{key}] deferred: no result after {timeout}s", flush=True)
+    return deferred
 
 
 if __name__ == "__main__":

@@ -1,8 +1,13 @@
 sample_key	species	h5ad
+3ca-gubin2018-othermodels	mouse	/home/users/chensj16/oak/data/sc/3ca/eca-pp/Gubin2018_othermodels/rsi/units/gubin2018-othermodels/release/final.h5ad
 brickman-mouse-01-mouse-reprocessed-mouse-early-embryo	mouse	/home/users/chensj16/oak/data/sc/brickman-mouse/eca-pp/01_mouse_reprocessed/rsi/units/mouse-early-embryo/release/final.h5ad
 calico-aging-lung	mouse	/home/users/chensj16/oak/data/sc/calico-aging/eca-pp/lung/rsi/units/lung/release/final.h5ad
 calico-aging-mouse-kidney	mouse	/home/users/chensj16/oak/data/sc/calico-aging/eca-pp/kidney/rsi/units/mouse-kidney/release/final.h5ad
 calico-aging-mouse-spleen	mouse	/home/users/chensj16/oak/data/sc/calico-aging/eca-pp/spleen/rsi/units/mouse-spleen/release/final.h5ad
+chondroatlas-02-sebastianetal-sebastian-2021-mouse-cartilage	mouse	/home/users/chensj16/oak/data/sc/chondroatlas/02_Sebastianetal/rsi/units/sebastian-2021-mouse-cartilage/release/final.h5ad
+chondroatlas-03-bubbetal-03-bubb-et-al-mouse-cartilage	mouse	/home/users/chensj16/oak/data/sc/chondroatlas/03_Bubbetal/rsi/units/03-bubb-et-al-mouse-cartilage/release/final.h5ad
+chondroatlas-13-kodamaetal-kodamaetal-mouse-growth-plate	mouse	/home/users/chensj16/oak/data/sc/chondroatlas/13_Kodamaetal/rsi/units/kodamaetal-mouse-growth-plate/release/final.h5ad
+chondroatlas-18-claytonetal-mouse-ivd	mouse	/home/users/chensj16/oak/data/sc/chondroatlas/18_Claytonetal/rsi/units/18-claytonetal-mouse-ivd/release/final.h5ad
 mca1.1-adrenalgland-adrenal-gland	mouse	/home/users/chensj16/oak/data/sc/mca1.1/eca-pp/AdrenalGland/rsi/units/adrenal-gland/release/final.h5ad
 mca1.1-bladder	mouse	/home/users/chensj16/oak/data/sc/mca1.1/eca-pp/Bladder/rsi/units/bladder/release/final.h5ad
 mca1.1-bonemarrow-bone-marrow	mouse	/home/users/chensj16/oak/data/sc/mca1.1/eca-pp/BoneMarrow/rsi/units/bone-marrow/release/final.h5ad
@@ -73,6 +78,8 @@ mca3.0-stomach	mouse	/home/users/chensj16/oak/data/sc/mca3.0/eca-pp/Stomach/rsi/
 mca3.0-testis	mouse	/home/users/chensj16/oak/data/sc/mca3.0/eca-pp/Testis/rsi/units/testis/release/final.h5ad
 mca3.0-thymus	mouse	/home/users/chensj16/oak/data/sc/mca3.0/eca-pp/Thymus/rsi/units/thymus/release/final.h5ad
 mca3.0-uterus	mouse	/home/users/chensj16/oak/data/sc/mca3.0/eca-pp/Uterus/rsi/units/uterus/release/final.h5ad
+mouse-pansci-mouse-duodenum-rag	mouse	/home/users/chensj16/oak/data/sc/mouse-pansci/eca-pp/duodenum_Rag/rsi/units/mouse-duodenum-rag/release/final.h5ad
+parse-5M-brain-female	mouse	/home/users/chensj16/oak/data/sc/parse-5M/eca-pp/brain_female/rsi/units/brain-female/release/final.h5ad
 parse-5M-brain-male	mouse	/home/users/chensj16/oak/data/sc/parse-5M/eca-pp/brain_male/rsi/units/brain-male/release/final.h5ad
 parse-5M-colon-female	mouse	/home/users/chensj16/oak/data/sc/parse-5M/eca-pp/colon_female/rsi/units/colon-female/release/final.h5ad
 parse-5M-quadricept-male	mouse	/home/users/chensj16/oak/data/sc/parse-5M/eca-pp/quadricept_male/rsi/units/quadricept-male/release/final.h5ad
@@ -149,6 +156,8 @@ tabula-muris-senis-facs-tongue	mouse	/home/users/chensj16/oak/data/sc/tabula-mur
 tabula-muris-senis-facs-trachea	mouse	/home/users/chensj16/oak/data/sc/tabula-muris-senis-facs/eca-pp/Trachea/rsi/units/trachea/release/final.h5ad
 tome-mouse-e10.5-e10-5-whole-embryo	mouse	/home/users/chensj16/oak/data/sc/tome-mouse/eca-pp/E10.5/rsi/units/e10-5-whole-embryo/release/final.h5ad
 tome-mouse-e11.5-e11-5-whole-embryo	mouse	/home/users/chensj16/oak/data/sc/tome-mouse/eca-pp/E11.5/rsi/units/e11-5-whole-embryo/release/final.h5ad
+tome-mouse-e12.5-e12-5	mouse	/home/users/chensj16/oak/data/sc/tome-mouse/eca-pp/E12.5/rsi/units/e12-5/release/final.h5ad
+tome-mouse-e13.5-e13-5-whole-embryo	mouse	/home/users/chensj16/oak/data/sc/tome-mouse/eca-pp/E13.5/rsi/units/e13-5-whole-embryo/release/final.h5ad
 tome-mouse-e3.5-e3-5-inner-cell-mass	mouse	/home/users/chensj16/oak/data/sc/tome-mouse/eca-pp/E3.5/rsi/units/e3-5-inner-cell-mass/release/final.h5ad
 tome-mouse-e4.5-mouse-e4-5-embryo	mouse	/home/users/chensj16/oak/data/sc/tome-mouse/eca-pp/E4.5/rsi/units/mouse-e4-5-embryo/release/final.h5ad
 tome-mouse-e5.25-e5-25-mouse-embryo	mouse	/home/users/chensj16/oak/data/sc/tome-mouse/eca-pp/E5.25/rsi/units/e5-25-mouse-embryo/release/final.h5ad

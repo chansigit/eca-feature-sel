@@ -4,7 +4,7 @@
 
 inputs_tsv:                                                  # sample_key/species/h5ad lists
   - mouse.tsv
-  # - human.tsv   # old sc-curation corpus: no var.highly_variable, needs hvg.compute: true
+  # - human.tsv   # 63 rsi units; human vocabulary waits for hcl (Oak)
 cache_root:  /scratch/users/chensj16/eca-feature-sel/cache   # all computed results (reused)
 venv_python: /scratch/users/chensj16/venvs/dl2025/.venv/bin/python
 ensembl_release: "116"                                       # for the biotype reference

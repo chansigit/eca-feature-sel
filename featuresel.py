@@ -18,8 +18,10 @@ import hashlib
 import json
 import os
 import re
+import multiprocessing as mp
 import shlex
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -31,6 +33,77 @@ pd.set_option("future.no_silent_downcasting", True)  # quiet fillna(False) on fl
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPECIES = ("human", "mouse")
+FS_TIMEOUT = 120          # seconds a batch of filesystem calls gets before the rest is deferred
+DEFERRED = []             # anything abandoned this run (see fs_parallel)
+
+
+def fs_parallel(fn, items, timeout=None, workers=64):
+    """fn(item) for every item, each in its own forked child; whatever has not
+    answered after `timeout` s is killed and listed as deferred.
+
+    Oak can hang a single stat()/open() for minutes. A hung *thread* would pin the
+    process at exit, a hung *child* is just abandoned, so the caller keeps going.
+    Children run with stdio on /dev/null so a stuck one cannot hold a pipe open.
+    Anyone calling this must finish with fs_exit() instead of a normal return.
+    Returns (results {item: value}, deferred [item])."""
+    items = list(items)
+    if not items:
+        return {}, []
+    timeout = FS_TIMEOUT if timeout is None else timeout
+    ctx = mp.get_context("fork")
+
+    def child(i, conn):
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        try:
+            conn.send((True, fn(items[i])))
+        except Exception as e:  # noqa: BLE001 - reported to the parent
+            conn.send((False, repr(e)))
+        conn.close()
+
+    out, deferred, running = {}, [], {}
+    pending = list(range(len(items)))
+    deadline = time.time() + timeout
+    while pending or running:
+        while pending and len(running) < workers:
+            i = pending.pop(0)
+            r, w = ctx.Pipe(duplex=False)
+            p = ctx.Process(target=child, args=(i, w), daemon=True)
+            p.start()
+            w.close()
+            running[i] = (p, r)
+        for i, (p, r) in list(running.items()):
+            if r.poll(0):
+                ok, val = r.recv()
+                r.close()
+                p.join()
+                if ok:
+                    out[items[i]] = val
+                del running[i]
+            elif not p.is_alive():      # died without answering
+                del running[i]
+        if time.time() > deadline:
+            break
+        time.sleep(0.05)
+    for i, (p, r) in running.items():
+        p.kill()                        # never joined: may sit in an Oak call
+        deferred.append(items[i])
+    deferred += [items[i] for i in pending]
+    DEFERRED.extend(deferred)
+    return out, deferred
+
+
+def fs_exit(code=0):
+    """Exit without joining children: a child stuck in an uninterruptible Oak call
+    would otherwise hold the interpreter forever."""
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
+def _stat(path):
+    return os.path.exists(path), (os.path.getmtime(path) if os.path.exists(path) else None)
 HVG_SOURCES = ["union", "global", "lineage", "upstream"]
 FLAGCOLS = ["is_protein_coding", "is_pseudogene", "is_OR", "is_vomeronasal", "is_taste",
             "is_IG_V", "is_IG_D", "is_IG_J", "is_IG_C", "is_TR_V", "is_TR_D", "is_TR_J",
@@ -88,19 +161,28 @@ def scan_inputs(cfg):
                 raise SystemExit(f"{path}:{n}: duplicate sample_key {key!r}")
             seen.add(key)
             h5ad = _resolve(h5ad, os.path.dirname(path))
-            if not os.path.exists(h5ad):
-                raise SystemExit(f"{path}:{n}: h5ad not found: {h5ad}")
-            out.append({"key": key, "species": sp, "h5ad": h5ad,
+            out.append({"key": key, "species": sp, "h5ad": h5ad, "line": f"{path}:{n}",
                         "out": os.path.join(cfg["_dirs"]["stats"], key + ".parquet")})
+    st, deferred = fs_parallel(_stat, [r["h5ad"] for r in out])
     for r in out:
-        r["stale"] = _is_stale(r, sig)
+        r["deferred"] = r["h5ad"] not in st
+        if r["deferred"]:
+            r["stale"] = False          # cannot tell; use the cache if there is one
+            continue
+        exists, mtime = st[r["h5ad"]]
+        if not exists:
+            raise SystemExit(f"{r['line']}: h5ad not found: {r['h5ad']}")
+        r["stale"] = _is_stale(r, sig, mtime)
+    if deferred:
+        print(f"warning: {len(deferred)} h5ad(s) not reachable within {FS_TIMEOUT}s, deferred: "
+              + ", ".join(r["key"] for r in out if r["deferred"]))
     return out
 
 
-def _is_stale(rec, sig):
+def _is_stale(rec, sig, h5ad_mtime):
     if not os.path.exists(rec["out"]):
         return True
-    if os.path.getmtime(rec["h5ad"]) > os.path.getmtime(rec["out"]):
+    if h5ad_mtime > os.path.getmtime(rec["out"]):
         return True
     meta = os.path.splitext(rec["out"])[0] + ".meta.json"
     try:
@@ -116,8 +198,9 @@ def cmd_status(cfg, args):
     for sp in SPECIES:
         s = [d for d in ds if d["species"] == sp]
         stale = [d for d in s if d["stale"]]
-        print(f"  {sp:6}: {len(s):3} datasets | up-to-date {len(s) - len(stale):3} | "
-              f"stale/missing {len(stale):3}")
+        dfr = [d for d in s if d["deferred"]]
+        print(f"  {sp:6}: {len(s):3} datasets | up-to-date {len(s) - len(stale) - len(dfr):3} | "
+              f"stale/missing {len(stale):3} | deferred (fs timeout) {len(dfr):3}")
     print(f"  TOTAL: {len(ds)} datasets, {sum(d['stale'] for d in ds)} need (re)compute")
     for sp in SPECIES:
         v = os.path.join(cfg["_dirs"]["vocab"], "latest", f"vocab_{sp}.tsv")
@@ -127,7 +210,7 @@ def cmd_status(cfg, args):
 
 def cmd_measure(cfg, args):
     ds = scan_inputs(cfg)
-    todo = ds if args.force else [d for d in ds if d["stale"]]
+    todo = [d for d in ds if (args.force or d["stale"]) and not d["deferred"]]
     if not todo:
         print("nothing to measure (all up-to-date). use --force to recompute.")
         return None
@@ -142,7 +225,8 @@ def cmd_measure(cfg, args):
     if args.local:
         jobs = args.jobs or max(1, len(os.sched_getaffinity(0)))
         print(f"running {len(todo)} dataset(s) locally with {jobs} process(es)", flush=True)
-        subprocess.run(f"{worker} --manifest {q(man)} --jobs {jobs}", shell=True, check=True)
+        subprocess.run(f"{worker} --manifest {q(man)} --jobs {jobs} --timeout {args.timeout}",
+                       shell=True, check=True)
         return None
     sl = cfg["slurm"]
     sb = os.path.join(cfg["_dirs"]["jobs"], f"measure_{stamp}.sbatch")
@@ -534,6 +618,30 @@ def _parse_mgi(path):
                          "biotype": m["Feature Type"].fillna("").map(_mgi_biotype)})
 
 
+HGNC_URL = "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
+
+
+def _hgnc_biotype(locus_type):
+    f = locus_type.lower()
+    if "protein product" in f:
+        return "protein_coding"
+    if "long non-coding" in f:
+        return "lncRNA"
+    if "pseudogene" in f:
+        return "pseudogene"
+    small = {"RNA, micro": "miRNA", "RNA, small nuclear": "snRNA", "RNA, small nucleolar": "snoRNA",
+             "RNA, ribosomal": "rRNA", "RNA, transfer": "tRNA", "RNA, misc": "misc_RNA",
+             "immunoglobulin gene": "IG_gene", "T cell receptor gene": "TR_gene"}
+    return small.get(locus_type, re.sub(r"\W+", "_", f).strip("_"))
+
+
+def _parse_hgnc(path):
+    """Genes the rsi harmonization could only key by HGNC accession (no Ensembl id)."""
+    m = pd.read_csv(path, sep="\t", dtype=str, usecols=["hgnc_id", "symbol", "locus_type"])
+    return pd.DataFrame({"harmonized_id": m["hgnc_id"], "symbol": m["symbol"],
+                         "biotype": m["locus_type"].fillna("").map(_hgnc_biotype)})
+
+
 def cmd_ref(cfg, args):
     rel = cfg["ensembl_release"]
     urls = {
@@ -550,12 +658,13 @@ def cmd_ref(cfg, args):
             print(f"[{sp}] downloading {url}")
             urllib.request.urlretrieve(url, gz)
         df = _parse_gtf(gz)
-        if sp == "mouse":
-            rpt = os.path.join(cfg["_dirs"]["ref"], os.path.basename(MGI_URL))
-            if not os.path.exists(rpt):
-                print(f"[{sp}] downloading {MGI_URL}")
-                urllib.request.urlretrieve(MGI_URL, rpt)
-            df = pd.concat([df, _parse_mgi(rpt)], ignore_index=True).drop_duplicates("harmonized_id")
+        # accession fallbacks: ids the rsi harmonization could not map to Ensembl
+        url, parse = (MGI_URL, _parse_mgi) if sp == "mouse" else (HGNC_URL, _parse_hgnc)
+        rpt = os.path.join(cfg["_dirs"]["ref"], os.path.basename(url))
+        if not os.path.exists(rpt):
+            print(f"[{sp}] downloading {url}")
+            urllib.request.urlretrieve(url, rpt)
+        df = pd.concat([df, parse(rpt)], ignore_index=True).drop_duplicates("harmonized_id")
         df = _add_flags(df, sp)
         df.to_parquet(out, index=False)
         print(f"[{sp}] genes={len(df)} protein_coding={int(df['is_protein_coding'].sum())} -> {out}")
@@ -573,6 +682,8 @@ def main():
         p.add_argument("--force", action="store_true")
         p.add_argument("--local", action="store_true", help="run here instead of via sbatch")
         p.add_argument("--jobs", type=int, help="processes for --local (default: CPUs available)")
+        p.add_argument("--timeout", type=int, default=1800,
+                       help="--local: seconds a dataset may take before it is abandoned (Oak hangs)")
     add_measure_opts(sub.add_parser("measure"))
     sub.add_parser("ref").add_argument("--force", action="store_true")
 
@@ -601,6 +712,7 @@ def main():
     cfg = load_config(args.config)
     {"status": cmd_status, "measure": cmd_measure, "ref": cmd_ref,
      "build": cmd_build, "refresh": cmd_refresh}[args.cmd](cfg, args)
+    fs_exit(0)
 
 
 if __name__ == "__main__":
