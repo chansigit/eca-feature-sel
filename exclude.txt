@@ -1,0 +1,2 @@
+# sample_keys scan_rsi.py leaves out of the input TSVs: one per line, # = reason.
+# (Oak runs re-processed by a gen2 run are dropped automatically via the run's spec.json input_root.)

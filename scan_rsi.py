@@ -8,6 +8,14 @@ sample_key/species/h5ad TSV that featuresel.py consumes. rsi runs that have no
 `release/final.h5ad` yet (still running, or never started) are listed, not
 written, so re-running this after they finish picks them up.
 
+Two layouts are understood, under any number of roots (``--root``, repeatable):
+
+    <root>/<dataset>/.../<group>/rsi/units/<unit>/release/final.h5ad   (Oak)
+    <root>/<batch>/<run>/units/<unit>/release/final.h5ad               (gen2 runs on scratch)
+
+Keys listed in ``exclude.txt`` (one sample_key per line, ``#`` comments) are
+left out, e.g. an Oak run that was re-processed on scratch.
+
 Every filesystem call runs in a forked child with a deadline (Oak can hang a
 single open() for minutes). Whatever does not answer in time is *deferred*: its
 row from the previous TSV is kept as is, and the next run checks it again.
@@ -20,6 +28,7 @@ row from the previous TSV is kept as is, and the next run checks it again.
 import argparse
 import csv
 import glob
+import json
 import os
 import re
 from collections import Counter
@@ -29,20 +38,39 @@ import h5py
 import featuresel
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_ROOT = os.path.expanduser("~/oak/data/sc")
+DEFAULT_ROOTS = [os.path.expanduser("~/oak/data/sc"),
+                 os.path.join(os.environ.get("SCRATCH", "/scratch/users/chensj16"),
+                              "eca-runs/gen2-acceptance-20260917")]
 PREFIX = {"ENSMUSG": "mouse", "ENSG": "human"}
 
 
-def sample_key(root, path):
-    """<dataset>-<group>-<unit>, dropping the group when it repeats a neighbour."""
-    parts = os.path.relpath(path, root).split("/")
-    top = parts[0]
-    group = parts[parts.index("rsi") - 1].lower().replace("_", "-")
-    unit = parts[parts.index("units") + 1]
-    keep_group = not (group == top or group in unit or unit in group)
-    return re.sub(r"-+", "-", "-".join([top] + ([group] if keep_group else []) + [unit]))
+def norm(name):
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", name.lower())).strip("-")
 
 
+def sample_key(root, run, multi=False):
+    """Oak layout <dataset>/.../<group>/rsi: <dataset>-<group>-<unit> (group dropped
+    when it repeats a neighbour). Batch layout <batch>/<run> with a spec.json:
+    the run's dataset_id, e.g. 'Tabula Sapiens / Ear' -> tabula-sapiens-ear,
+    plus the unit when the run has several."""
+    keys = []
+    for path in run["units"]:
+        parts = os.path.relpath(path, root).split("/")
+        u = parts.index("units")
+        unit = parts[u + 1]
+        if parts[u - 1] == "rsi":
+            top, group = parts[0], norm(parts[u - 2])
+            keep_group = not (group == top or group in unit or unit in group)
+            base = [top] + ([group] if keep_group else []) + [unit]
+        else:
+            base = [norm(run["dataset_id"] or parts[u - 1])] + ([unit] if multi else [])
+        keys.append(re.sub(r"-+", "-", "-".join(base)))
+    return keys
+
+
+def rel_dataset(path):
+    """Path of a dataset dir relative to the corpus root, whichever alias of Oak is used."""
+    return path.split("/data/sc/", 1)[1] if "/data/sc/" in path else path
 def peek(path):
     """(species, n_cells, n_genes) from metadata only; species from the gene ids."""
     with h5py.File(path, "r") as f:
@@ -64,18 +92,29 @@ def peek(path):
 
 
 def scan_top(top):
-    """One top-level dataset dir -> (finished unit paths, unfinished rsi runs)."""
-    rsis = sorted({p for d in (0, 1, 2) for p in glob.glob(f"{top}/{'*/' * d}rsi")})
-    units, incomplete = [], []
-    for rsi in rsis:
-        all_units = glob.glob(f"{rsi}/units/*/")
-        done = sorted(glob.glob(f"{rsi}/units/*/release/final.h5ad"))
-        units += done
+    """One top-level dir -> list of runs. A run is any directory holding units/
+    (an Oak .../<group>/rsi or a scratch <batch>/<run>); units/ dirs nested inside
+    another run (e.g. <run>/00-organize/units) are stages, not runs."""
+    cands = sorted({os.path.dirname(p) for d in (0, 1, 2, 3) for p in glob.glob(f"{top}/{'*/' * d}units")})
+    runs = [r for r in cands if not any(r.startswith(o + "/") for o in cands if o != r)]
+    out = []
+    for run in runs:
+        all_units = glob.glob(f"{run}/units/*/")
+        done = sorted(glob.glob(f"{run}/units/*/release/final.h5ad"))
+        rec = {"run": run, "units": done, "n_units": len(all_units), "dataset_id": None,
+               "input_root": None, "mtime": max((os.path.getmtime(p) for p in done), default=0)}
+        spec = os.path.join(run, "spec.json")
+        if os.path.exists(spec):
+            try:
+                d = json.load(open(spec))
+                rec["dataset_id"], rec["input_root"] = d.get("dataset_id"), d.get("input_root")
+            except ValueError:
+                pass
         if len(done) < len(all_units) or not all_units:
-            status = os.path.join(rsi, "status.txt")
-            last = open(status).read().strip().splitlines()[-1] if os.path.exists(status) else ""
-            incomplete.append((rsi, len(all_units), len(done), last))
-    return units, incomplete
+            status = os.path.join(run, "status.txt")
+            rec["last"] = open(status).read().strip().splitlines()[-1] if os.path.exists(status) else ""
+        out.append(rec)
+    return out
 
 
 def read_tsv(path):
@@ -88,7 +127,9 @@ def read_tsv(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default=DEFAULT_ROOT)
+    ap.add_argument("--root", action="append", help=f"repeatable; default {DEFAULT_ROOTS}")
+    ap.add_argument("--exclude", default=os.path.join(HERE, "exclude.txt"),
+                    help="sample_keys to leave out, one per line, # comments")
     ap.add_argument("--species", default="mouse", choices=sorted(set(PREFIX.values())))
     ap.add_argument("--out", help="default: <species>.tsv next to this script")
     ap.add_argument("--list", action="store_true", help="report only, write nothing")
@@ -98,39 +139,77 @@ def main():
     out = a.out or os.path.join(HERE, f"{a.species}.tsv")
     old = read_tsv(out)
 
-    # stage 0: the root listing; stage 1: each dataset dir; stage 2: each h5ad
-    res, dfr = featuresel.fs_parallel(os.listdir, [a.root], a.timeout)
+    roots = a.root or DEFAULT_ROOTS
+    excluded = {}
+    if os.path.exists(a.exclude):
+        for line in open(a.exclude):
+            key, _, why = line.partition("#")
+            if key.strip():
+                excluded[key.strip()] = why.strip()
+
+    # stage 0: each root listing; stage 1: each top-level dir; stage 2: each h5ad
+    res, dfr = featuresel.fs_parallel(os.listdir, roots, a.timeout)
     if dfr:
-        raise SystemExit(f"cannot even list {a.root} within {a.timeout}s; try later")
-    tops = sorted(os.path.join(a.root, d) for d in res[a.root] if not d.startswith("."))
+        raise SystemExit(f"cannot even list {dfr} within {a.timeout}s; try later")
+    tops = sorted(os.path.join(r, d) for r in roots for d in res[r] if not d.startswith("."))
     res, slow_tops = featuresel.fs_parallel(scan_top, tops, a.timeout)
-    units = sorted(p for u, _ in res.values() for p in u)
-    incomplete = sorted(i for _, inc in res.values() for i in inc)
+    runs = [r for recs in res.values() for r in recs]
+    incomplete = sorted((r["run"], r["n_units"], len(r["units"]), r["last"]) for r in runs if "last" in r)
+    units = sorted(p for r in runs for p in r["units"])
     res, slow_files = featuresel.fs_parallel(peek, units, a.timeout)
 
-    rows, bad = [], []
-    for path in units:
-        if path in slow_files:
-            continue
-        info, err = res.get(path, (None, "unreadable"))
-        if err:
-            bad.append((path, err))
-            continue
-        sp, shape = info
-        rows.append({"key": sample_key(a.root, path), "species": sp, "path": path, "shape": shape})
+    # a gen2 run re-processed an Oak dataset: its input_root sits in that dataset's
+    # dir, so the Oak run there is superseded (the gen2 one is the newer pipeline)
+    reprocessed = {rel_dataset(os.path.dirname(r["input_root"])): r for r in runs
+                   if r["input_root"] and r["units"]}
+    rows, bad, left_out, superseded = [], [], [], []
+    for run in runs:
+        root = next(rt for rt in roots if run["run"].startswith(rt + "/"))
+        keys = sample_key(root, run, multi=len(run["units"]) > 1)
+        for path, key in zip(run["units"], keys):
+            if path in slow_files:
+                continue
+            info, err = res.get(path, (None, "unreadable"))
+            if err:
+                bad.append((path, err))
+                continue
+            sp, shape = info
+            if os.path.basename(run["run"]) == "rsi":
+                newer = reprocessed.get(rel_dataset(os.path.dirname(run["run"])))
+                if newer:
+                    superseded.append((key, sp, newer["dataset_id"]))
+                    continue
+            if key in excluded:
+                left_out.append((key, sp, excluded[key]))
+                continue
+            rows.append({"key": key, "species": sp, "path": path, "shape": shape, "mtime": run["mtime"]})
+
+    # the same dataset finished twice in one batch (a retried run): keep the newest
+    by_key = {}
+    for r in rows:
+        if r["key"] not in by_key or r["mtime"] > by_key[r["key"]]["mtime"]:
+            by_key[r["key"]] = r
+    retried = [r for r in rows if by_key[r["key"]] is not r]
+    rows = list(by_key.values())
 
     dup = [k for k, n in Counter(r["key"] for r in rows).items() if n > 1]
     if dup:
         raise SystemExit(f"duplicate sample_key(s): {dup}")
 
-    print(f"{len(rows)} completed unit(s) under {a.root}: "
+    print(f"{len(rows)} completed unit(s) under {roots}: "
           f"{dict(Counter(r['species'] for r in rows))}")
     for path, err in bad:
         print(f"  skipped ({err}): {path}")
+    for key, sp, by in superseded:
+        print(f"  superseded ({sp}) {key}: re-processed by gen2 run '{by}'")
+    for r in retried:
+        print(f"  older duplicate run dropped ({r['species']}) {r['key']}: {r['path']}")
+    for key, sp, why in left_out:
+        print(f"  excluded ({sp}) {key}: {why}")
     if incomplete:
         print(f"  {len(incomplete)} rsi run(s) with no finished unit yet:")
-        for rsi, n_units, n_done, last in incomplete:
-            print(f"    units={n_units} final={n_done}  {rsi}  {last}")
+        for run, n_units, n_done, last in incomplete:
+            print(f"    units={n_units} final={n_done}  {run}  {last}")
 
     # deferred: keep whatever the previous TSV said about them
     kept = {}
@@ -141,7 +220,7 @@ def main():
     if slow_tops or slow_files:
         print(f"  DEFERRED (no answer within {a.timeout}s): {len(slow_tops)} dataset dir(s) "
               f"{[os.path.basename(t) for t in slow_tops]}, {len(slow_files)} file(s) "
-              f"{[sample_key(a.root, p) for p in slow_files]}; "
+              f"{[os.path.relpath(p, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(p))))) for p in slow_files]}; "
               f"kept {len(kept)} row(s) from the previous {os.path.basename(out)}. Re-run later.")
 
     keep = sorted([r for r in rows if r["species"] == a.species], key=lambda r: r["key"])

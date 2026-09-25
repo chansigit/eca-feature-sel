@@ -4,7 +4,7 @@
 
 inputs_tsv:                                                  # sample_key/species/h5ad lists
   - mouse.tsv
-  # - human.tsv   # 63 rsi units; human vocabulary waits for hcl (Oak)
+  - human.tsv
 cache_root:  /scratch/users/chensj16/eca-feature-sel/cache   # all computed results (reused)
 venv_python: /scratch/users/chensj16/venvs/dl2025/.venv/bin/python
 ensembl_release: "116"                                       # for the biotype reference
@@ -65,4 +65,4 @@ selection:
   #         state), small RNAs (poly-A capture artefacts), TEC (unconfirmed loci)
   category_keep: [is_IG_C, is_TR_C, is_sex]
   category_drop: [is_pseudogene, is_IG_V, is_IG_D, is_IG_J, is_TR_V, is_TR_D, is_TR_J,
-                  TEC, miRNA, snoRNA, snRNA, scaRNA, misc_RNA, rRNA, Mt_tRNA, Mt_rRNA, ribozyme]
+                  TEC, miRNA, snoRNA, snRNA, scaRNA, misc_RNA, rRNA, Mt_tRNA, Mt_rRNA, ribozyme, vault_RNA]

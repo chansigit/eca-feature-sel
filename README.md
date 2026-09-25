@@ -174,6 +174,16 @@ A dataset is re-measured only if its `h5ad` is newer than the cached result or
 the `hvg:` block of the config changed (its hash is stored with each result).
 Removing a dataset from the TSV removes it from the next build.
 
+### Where inputs come from
+
+`scan_rsi.py` walks two kinds of roots (`--root`, repeatable): the Oak corpus
+(`<dataset>/.../rsi/units/<unit>/release/final.h5ad`) and the gen2 run batches on
+scratch (`<batch>/<run>/units/<unit>/release/final.h5ad`, keyed by the run's
+`dataset_id` from `spec.json`). A gen2 run whose `input_root` points into an Oak
+dataset supersedes that dataset's Oak run, so nothing is counted twice; the same
+dataset finished twice in a batch keeps the newest run. Keys in `exclude.txt`
+are left out by hand.
+
 ### Input requirements
 
 Each `h5ad` needs `layers/counts` (raw counts; csr, csc or dense all work) and
@@ -197,7 +207,8 @@ hvg.py           the scoring: vst (and Pearson residuals), dataset-level + per l
 votes.py         corpus vote explorer (HTML)
 report.py        per-dataset HTML reports
 explore.py       single-dataset interactive explorer (HTML)
-scan_rsi.py      eca-rsi results -> input TSV
+scan_rsi.py      eca-rsi results (Oak corpus + gen2 batches on scratch) -> input TSV
+exclude.txt      sample_keys to leave out of the TSVs, with reasons
 test_worker.py   self-check (python test_worker.py)
 config.yaml      paths, Slurm resources, hvg / selection defaults
 mouse.tsv        mouse inputs        human.tsv   human inputs
